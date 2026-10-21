@@ -21,10 +21,27 @@ const MAP_CAP = 500 // cache / outboundMap 条目上限（FIFO 淘汰最旧，�
 /** userConfig 传入的配置（register 时初始化） */
 const cfg = { showByDefault: false, outbound: true, lang: 'zh-Hans', provider: 'microsoft', model: 'haiku', baseUrl: 'http://127.0.0.1:8021/v1', apiKey: '' }
 
-/** 显示开关（快捷键翻转；初始值来自 showByDefault 配置） */
+/** 回复译文显示偏好；enabled 控制两侧翻译的启停。 */
 let show = false
+let enabled = true
+let generation = 0
+let lifecycle = new AbortController()
+const TRANSLATION_SIGNAL = Symbol('translationSignal')
+const TRANSLATION_EPOCH = Symbol('translationEpoch')
 
-/** 原文 -> { state: 'pending'|'done'|'skip'|'error', md? }，按消息块缓存 */
+// Carry the starting generation through every chunk and retry of a translation.
+function translationScope($) {
+  if ($[TRANSLATION_EPOCH] !== undefined) return $
+  return Object.assign(Object.create($), { [TRANSLATION_EPOCH]: generation, [TRANSLATION_SIGNAL]: lifecycle.signal })
+}
+
+function assertTranslationActive($) {
+  if (!enabled || ($[TRANSLATION_EPOCH] !== undefined && $[TRANSLATION_EPOCH] !== generation)) {
+    throw new Error('translation disabled or superseded')
+  }
+}
+
+/** 原文 -> { state: 'pending'|'done'|'skip'|'error', md?, paras? }，保留逐段结果供失败重试。 */
 const cache = new Map()
 
 /** 发出的英文 -> 用户原话：UserMessage 渲染层做双语对照（不落盘、不进上下文） */
@@ -77,12 +94,14 @@ function parseBody(res) {
 }
 
 async function msFetch($, text, to = cfg.lang) {
+  assertTranslationActive($)
   const qs = new URLSearchParams({ from: '', to, isEnterpriseClient: 'false' })
   const res = await $.http.fetch(`https://edge.microsoft.com/translate/translatetext?${qs}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify([text]),
   })
+  assertTranslationActive($)
   if (!res.ok) throw new Error(`microsoft HTTP ${res.status}`)
   const body = parseBody(res)
   if (!Array.isArray(body) || body.length !== 1) throw new Error('microsoft bad response')
@@ -107,13 +126,15 @@ const MODEL_SYSTEM = () =>
   'Return ONLY the translation, no preamble, no notes.'
 
 async function modelFetch($, text, system) {
+  assertTranslationActive($)
   const r = await $.model.complete({
     model: cfg.model,
     system: system ?? MODEL_SYSTEM(),
     prompt: text,
     maxTokens: MAX_TOKENS,
     timeoutMs: MODEL_TIMEOUT,
-  })
+  }, { signal: $[TRANSLATION_SIGNAL] ?? lifecycle.signal })
+  assertTranslationActive($)
   if (!r.isAnswered) throw new Error(`model did not answer (${r.reason ?? 'unknown'})`)
   return { out: r.text.trim(), from: '' }
 }
@@ -132,6 +153,7 @@ function stripThink(s) {
 }
 
 async function openaiFetch($, text, system) {
+  assertTranslationActive($)
   const base = cfg.baseUrl.replace(/\/+$/, '')
   const payload = JSON.stringify({
     model: cfg.model,
@@ -147,6 +169,7 @@ async function openaiFetch($, text, system) {
     '-H', 'Content-Type: application/json', '--data-binary', payload]
   if (cfg.apiKey) args.push('-H', `Authorization: Bearer ${cfg.apiKey}`)
   const r = await $.process.run(args)
+  assertTranslationActive($)
   if (r.exitCode !== 0) throw new Error(`openai curl exit ${r.exitCode}`)
   const body = JSON.parse(r.stdout)
   if (body?.choices?.[0]?.finish_reason === 'length') throw new Error('openai truncated (finish_reason=length)')
@@ -379,14 +402,17 @@ async function translateProse($, text) {
 
 /**
  * 翻一个消息块，逐段穿插：每段原文下面直接跟它自己的 `> ` 译文；
- * 代码块/原始分隔符不送翻且原样拼回。返回 { md, errors }。
+ * 代码块/原始分隔符不送翻且原样拼回。返回 { md, errors, paras }。
+ * 重试时复用已完成/跳过的段落，只重新请求失败段落。
  * 全部跳过（已是目标语言/无散文）时 md 为 null。
  * 段落并行翻（并发 4）：本地 llama.cpp 有连续 batching，串行会让长回复等几十秒。
  */
-async function translateBlock($, text) {
-  const paras = splitParas(text)
+async function translateBlock($, text, previousParas) {
+  $ = translationScope($)
+  const paras = previousParas ? previousParas.map(p => ({ ...p })) : splitParas(text)
   await runPool(paras, 4, async (p) => {
-    if (p.text === undefined) return
+    if (p.text === undefined || (previousParas && !p.error)) return
+    delete p.error
     try {
       const translation = await translateProse($, p.text)
       if (translation) p.translation = translation
@@ -408,7 +434,7 @@ async function translateBlock($, text) {
     }
     return p.text
   }).join('')
-  return { md: any ? md : null, errors }
+  return { md: any ? md : null, errors, paras }
 }
 
 /* ---------------- 出站：保证发给模型的一定是英文 ---------------- */
@@ -590,6 +616,7 @@ async function rewriteEnglishProse($, text) {
 
 /** 出站整块：代码/分隔符不动，散文段并发处理；返回 { text, changed, errors }（没改动时 text 即原文） */
 async function outboundBlock($, text) {
+  $ = translationScope($)
   const paras = splitParas(text)
   await runPool(paras, 4, async (p) => {
     if (p.text === undefined) return
@@ -622,14 +649,17 @@ function diag($, msg) {
   $.fs.write('/tmp/pt-live.log', dbg.join('\n') + '\n').catch(() => {})
 }
 
-function scheduleOne($, text) {
-  if (cache.has(text)) return
-  putCapped(cache, text, { state: 'pending' })
+function scheduleOne($, text, retry = false) {
+  const previous = cache.get(text)
+  if (!enabled || (previous && (!retry || previous.state === 'pending'))) return
+  const epoch = generation
+  putCapped(cache, text, { ...previous, state: 'pending', previous })
   diag($, `schedule len=${text.length}`)
-  translateBlock($, text)
-    .then(({ md, errors }) => {
+  translateBlock($, text, previous?.paras)
+    .then(({ md, errors, paras }) => {
+      if (!enabled || epoch !== generation) return
       const state = md ? 'done' : errors ? 'error' : 'skip'
-      putCapped(cache, text, { state, md, errors })
+      putCapped(cache, text, { state, md, errors, paras })
       diag($, `done len=${text.length} state=${state} errors=${errors}${md ? ' md=' + md.length : ''}`)
       if (show) {
         $.ui.invalidate('ui.render')
@@ -638,16 +668,20 @@ function scheduleOne($, text) {
       }
     })
     .catch((err) => {
-      putCapped(cache, text, { state: 'error', errors: 1 })
+      if (!enabled || epoch !== generation) return
+      putCapped(cache, text, previous ?? { state: 'error', errors: 1 })
       diag($, `error len=${text.length}: ${String((err && err.message) || err).slice(0, 150)}`)
       if (show) $.ui.toast('翻译失败，见 /tmp/pt-live.log')
     })
 }
 
 function onRenderText($, text) {
+  if (!enabled) return
+  const epoch = generation
   seen.add(text)
   if (stableTimer) stableTimer.cancel()
   stableTimer = $.clock.after(1500, () => {
+    if (!enabled || epoch !== generation) return
     stableTimer = null
     const texts = [...seen]
     seen.clear()
@@ -655,7 +689,53 @@ function onRenderText($, text) {
   })
 }
 
+function toggleShow($) {
+  show = !show
+  if (enabled && show) {
+    for (const [text, entry] of cache) {
+      if (entry.state === 'error' || entry.errors) {
+        scheduleOne($, text, true)
+      }
+    }
+  }
+  diag($, `toggle show=${show}`)
+  $.ui.toast(`译文：${show ? '显示' : '隐藏'}`)
+  $.ui.invalidate('ui.render')
+}
+
+function setTranslationEnabled($, next) {
+  if (enabled !== next) {
+    enabled = next
+    generation++
+    lifecycle.abort()
+    if (stableTimer) stableTimer.cancel()
+    stableTimer = null
+    seen.clear()
+    for (const [text, entry] of cache) {
+      if (entry.state === 'pending') {
+        if (entry.previous) cache.set(text, entry.previous)
+        else cache.delete(text)
+      }
+    }
+    if (enabled) {
+      lifecycle = new AbortController()
+      for (const [text, entry] of cache) {
+        if (entry.state === 'error' || entry.errors) scheduleOne($, text, true)
+      }
+    }
+  }
+  const status = `Translation: ${enabled ? 'on' : 'off'}`
+  $.ui.status(status)
+  $.ui.toast(status)
+  diag($, `translation enabled=${enabled}`)
+  $.ui.invalidate('ui.render')
+}
+
 export function register(on, options) {
+  lifecycle.abort()
+  lifecycle = new AbortController()
+  generation++
+  enabled = true
   if (stableTimer) stableTimer.cancel()
   stableTimer = null
   seen.clear()
@@ -676,33 +756,29 @@ export function register(on, options) {
 
   on('session.start', async ($, e, next) => {
     outboundMap.clear()
-    await $.command.register({ name: 'translate', description: 'Show/hide translation of replies' })
+    await $.command.register({ name: 'translate', description: 'Toggle reply translation display; on/off enables/disables translation', immediate: true })
+    $.ui.status(`Translation: ${enabled ? 'on' : 'off'}`)
     diag($, `loaded provider=${cfg.provider} model=${cfg.model} baseUrl=${cfg.baseUrl} showByDefault=${cfg.showByDefault} outbound=${cfg.outbound} lang=${cfg.lang}`)
     return next(e)
   })
 
-  on('command.run', { command: 'translate' }, async ($) => {
-    show = !show
-    diag($, `toggle show=${show}`)
-    if (show) {
-      // 等待反馈：还有段在翻时直接告诉用户，免得对着空白狂按
-      const pending = [...cache.values()].filter((e) => e.state === 'pending').length
-      const error = [...cache.values()].filter((e) => e.state === 'error' || e.errors).length
-      if (pending) $.ui.toast(`翻译中（还有 ${pending} 块，本地模型较慢）…`)
-      else if (error) $.ui.toast('部分翻译失败，详见 /tmp/pt-live.log')
-      else $.ui.toast('译文：显示')
-    } else {
-      $.ui.toast('译文：隐藏')
+  on('command.run', { command: 'translate' }, async ($, e) => {
+    const state = (e.args ?? '').trim().toLowerCase()
+    if (state && state !== 'on' && state !== 'off') {
+      $.ui.toast('Usage: /translate [on|off]')
+      return {}
     }
-    $.ui.invalidate('ui.render')
+    if (state) setTranslationEnabled($, state === 'on')
+    else toggleShow($)
     return {}
   })
 
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
+    if (!enabled) return next(e)
     const text = e.props?.text
     if (!text || !text.trim()) return next(e)
 
-    // 默认就翻（与显示无关）：防抖 1.5s，文本稳定后才调度（见 onRenderText）。
+    // 启用时预翻译（与 showByDefault 的显示偏好无关）；稳定 1.5s 后调度。
     // onRenderText 只登记防抖，不会同步写 cache，这里不必重读。
     const entry = cache.get(text)
     if (!entry) onRenderText($, text)
@@ -711,7 +787,7 @@ export function register(on, options) {
 
     // 诊断：show=true 时记录每次渲染到达，用于排查「切了显示但没重画」
     diag($, `render len=${text.length} state=${entry ? entry.state : 'none'}`)
-    if (!entry || entry.state !== 'done') return next(e)
+    if (!entry?.md) return next(e)
 
     // 缓存里已是拼好的逐段穿插版本，直接替换显示文本（只影响渲染，不落盘不进上下文）
     return next({ ...e, props: { ...e.props, text: entry.md } })
@@ -720,10 +796,12 @@ export function register(on, options) {
   // 出站：本机敲 Enter 的提示词改写成英文再进会话（插件/peer/通知的提交不动）
   on('prompt.submit', { origin: { kind: 'composer' } }, async ($, e, next) => {
     const text = e.text ?? ''
-    if (!cfg.outbound || !text.trim() || text.startsWith('/')) return next(e)
+    if (!enabled || !cfg.outbound || !text.trim() || text.startsWith('/')) return next(e)
+    const epoch = generation
     try {
       if (cfg.provider !== 'microsoft' && text.length > 120) $.ui.toast('正在把提示词转成英文…')
       const { text: en, changed, errors } = await outboundBlock($, text)
+      if (!enabled || epoch !== generation) return next(e)
       if (!changed || !en.trim()) {
         if (errors) $.ui.toast('提示词英文转换失败，已原样发送（见 /tmp/pt-live.log）')
         return next(e)
@@ -734,6 +812,7 @@ export function register(on, options) {
       // 模型与落盘都是英文；屏幕上的用户行跟着变英文，由下面的渲染钩子画成双语对照
       return next({ ...e, text: en })
     } catch (err) {
+      if (!enabled || epoch !== generation) return next(e)
       diag($, `outbound error: ${String((err && err.message) || err).slice(0, 150)}`)
       return next(e) // 任何失败都原样放行，绝不拦提示词
     }
@@ -741,6 +820,7 @@ export function register(on, options) {
 
   // 用户消息行的双语对照：原文在上，实际发出的英文 `> ` 引用在下（只影响渲染）
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
+    if (!enabled) return next(e)
     const text = e.props?.text
     const orig = text ? outboundMap.get(text) : undefined
     if (orig === undefined || orig === null) return next(e)

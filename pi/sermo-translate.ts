@@ -15,7 +15,7 @@
  *  - openai：OpenAI 兼容端点（本地 llama.cpp 等）
  */
 import { getAgentDir, type ExtensionAPI, type ExtensionContext, type MessageEndEvent } from "@earendil-works/pi-coding-agent";
-import type { KeyId } from "@earendil-works/pi-tui";
+import type { KeyId, TUI } from "@earendil-works/pi-tui";
 import { readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -46,8 +46,10 @@ const cfg = {
 	toggleKey: "ctrl+y",
 }
 
-/** 显示开关（Ctrl+Y / /translate 翻转；初始值来自 showByDefault 配置） */
+/** 回复译文是否显示（由 showByDefault 配置控制）；enabled 控制两侧翻译的启停。 */
 let show = false
+let enabled = true
+let enableGeneration = 0
 
 /** Paragraph translations are matched against rendered prose, even after another transformer changes code blocks. */
 type CacheEntry = { state: "pending" | "done" | "skip" | "error"; translation?: string; promise?: Promise<void> }
@@ -58,6 +60,8 @@ const outboundMap = new Map<string, string | null>()
 const seenUserTexts = new Set<string>()
 const pendingOutbound = new Map<string, number>()
 let generation = 0
+let branchGeneration = 0
+let transcriptRenderer: Pick<TUI, "invalidate" | "requestRender"> | undefined
 let lifecycle = new AbortController()
 let activeContext: ExtensionContext | undefined
 let translationWorkers = 0
@@ -692,15 +696,27 @@ function errorText(err: unknown) {
 
 /* ---------------- 调度与显示 ---------------- */
 
-/**
- * 翻译完成后的重绘：pi 没有直接「重绘 transcript」的扩展入口，setHiddenThinkingLabel
- * 会让所有 AssistantMessageComponent 重建（updateContent），markdown transformer 随之重跑。
- * 副作用：会把自定义的隐藏思考标签重置为默认值——可接受（只影响折叠思考块的标签文字）。
- */
+/** Capture Pi's renderer so state changes invalidate cached user and assistant Markdown. */
+function attachTranscriptRenderer(ctx: ExtensionContext) {
+	if (ctx.mode !== "tui") return
+	// An empty widget exposes the public TUI handle without replacing the editor or footer.
+	ctx.ui.setWidget("sermo-translate-renderer", (tui) => {
+		transcriptRenderer = tui
+		return {
+			render: () => [],
+			invalidate() {},
+			dispose() {
+				if (transcriptRenderer === tui) transcriptRenderer = undefined
+			},
+		}
+	}, { placement: "belowEditor" })
+}
+
 function refreshTranscript(ctx: ExtensionContext) {
 	try {
 		if (ctx.mode !== "tui") return
-		ctx.ui.setHiddenThinkingLabel("Thinking...")
+		transcriptRenderer?.invalidate()
+		transcriptRenderer?.requestRender()
 	} catch {
 		/* 翻译完成时会话可能已关闭（ctx 过期）——没东西可刷，静默 */
 	}
@@ -715,6 +731,7 @@ function toast(ctx: ExtensionContext, msg: string) {
 }
 
 function scheduleOne(ctx: ExtensionContext, text: string, retry = false): Promise<void> {
+	if (!enabled) return Promise.resolve()
 	const previous = cache.get(text)
 	if (previous && !(retry && previous.state === "error")) return previous.promise ?? Promise.resolve()
 	const entry: CacheEntry = { state: "pending" }
@@ -750,7 +767,7 @@ function scheduleBlock(ctx: ExtensionContext, text: string) {
 }
 
 function scheduleMessage(ctx: ExtensionContext, msg: MessageEndEvent["message"]) {
-	if (msg.role !== "assistant" || ctx.mode !== "tui") return
+	if (!enabled || msg.role !== "assistant" || ctx.mode !== "tui") return
 	let thinking: string[] = []
 	const flushThinking = () => {
 		if (thinking.length) void scheduleBlock(ctx, thinking.join("\n\n"))
@@ -773,6 +790,7 @@ function userText(message: Extract<MessageEndEvent["message"], { role: "user" }>
 }
 
 function resetBranchState() {
+	branchGeneration++
 	generation++
 	lifecycle.abort()
 	activeContext = undefined
@@ -794,29 +812,49 @@ function restoreBranch(ctx: ExtensionContext) {
 	}
 }
 
-/** 切换显示并给出状态反馈（Ctrl+Y 与 /translate 共用）；命令/快捷键触发时 ctx 一定新鲜 */
+function updateTranslationStatus(ctx: ExtensionContext) {
+	if (ctx.mode === "tui" || ctx.hasUI) {
+		ctx.ui.setStatus("sermo-translate", `Translation: ${enabled ? "on" : "off"}`)
+	}
+}
+
 function toggleShow(ctx: ExtensionContext) {
 	show = !show
+	if (enabled && show) {
+		for (const [text, entry] of cache) {
+			if (entry.state === "error") void scheduleOne(ctx, text, true)
+		}
+	}
 	diag(`toggle show=${show}`)
-	try {
-		if (ctx.mode === "tui" || ctx.hasUI) {
-			if (show) {
-				const failed = [...cache].filter(([, entry]) => entry.state === "error").map(([text]) => text)
-				void runPool(failed, 4, async (text) => { await scheduleOne(ctx, text, true) })
-				const entries = [...cache.values()]
-				const pending = entries.filter((e) => e.state === "pending").length
-				const error = entries.filter((e) => e.state === "error").length
-				if (pending) toast(ctx, `翻译中（还有 ${pending} 块，本地模型较慢）…`)
-				else if (error) toast(ctx, `部分翻译失败，详见 ${LOG_PATH}`)
-				else toast(ctx, "译文：显示")
-			} else {
-				toast(ctx, "译文：隐藏")
+	toast(ctx, `译文：${show ? "显示" : "隐藏"}`)
+	refreshTranscript(ctx)
+}
+
+/** Enable or disable both outgoing rewrites and reply translation. */
+function toggleTranslation(ctx: ExtensionContext, next = !enabled) {
+	if (enabled !== next) {
+		enabled = next
+		enableGeneration++
+		generation++
+		lifecycle.abort()
+		for (const [text, entry] of cache) {
+			if (entry.state === "pending") cache.delete(text)
+		}
+		if (enabled) {
+			lifecycle = new AbortController()
+			activeContext = ctx
+			for (const [text, entry] of cache) {
+				if (entry.state === "error") void scheduleOne(ctx, text, true)
+			}
+			for (const entry of ctx.sessionManager.getBranch()) {
+				if (entry.type === "message") scheduleMessage(ctx, entry.message)
 			}
 		}
-		refreshTranscript(ctx)
-	} catch {
-		/* 显示开关已翻转，后续渲染自然生效 */
 	}
+	updateTranslationStatus(ctx)
+	diag(`translation enabled=${enabled}`)
+	toast(ctx, `Translation: ${enabled ? "on" : "off"}`)
+	refreshTranscript(ctx)
 }
 
 /* ---------------- 扩展入口 ---------------- */
@@ -839,8 +877,16 @@ function toggleShow(ctx: ExtensionContext) {
 	}
 
 	pi.registerCommand("translate", {
-		description: "Show/hide translation of replies (same as the toggle key)",
-		handler: async (_args, ctx) => toggleShow(ctx),
+		description: "Toggle reply translation display; on/off enables/disables translation",
+		handler: async (args, ctx) => {
+			const state = args.trim().toLowerCase()
+			if (state && state !== "on" && state !== "off") {
+				toast(ctx, "Usage: /translate [on|off]")
+				return
+			}
+			if (state) toggleTranslation(ctx, state === "on")
+			else toggleShow(ctx)
+		},
 	})
 
 	// 渲染层（唯一改显示的地方；会话存储与模型上下文不受影响）：
@@ -848,6 +894,7 @@ function toggleShow(ctx: ExtensionContext) {
 	//  - user：发出的英文命中 outboundMap 时，画成「原文在上、英文引用在下」的对照
 	pi.registerMarkdownTransformer((md, mctx) => {
 		try {
+			if (!enabled) return md
 			if (mctx.messageType === "assistant" || mctx.messageType === "assistant-thinking") {
 				if (!show) return md
 				return splitParas(md).map((part) => {
@@ -898,14 +945,16 @@ function toggleShow(ctx: ExtensionContext) {
 	// 扩展注入（sendUserMessage）的提交不碰。任何失败都原样放行，绝不拦提示词。
 	pi.on("input", async (event, ctx) => {
 		const text = event.text ?? ""
-		if (event.source !== "interactive" || !cfg.outbound || !text.trim() || text.startsWith("/")) {
+		if (!enabled || event.source !== "interactive" || !cfg.outbound || !text.trim() || text.startsWith("/")) {
 			return { action: "continue" }
 		}
-		const epoch = generation
+		const inputBranchGeneration = branchGeneration
+		const inputEnableGeneration = enableGeneration
 		try {
 			if (cfg.provider !== "microsoft" && text.length > 120) toast(ctx, "正在把提示词转成英文…")
 			const { text: en, changed, errors } = await outboundBlock(ctx, text)
-			if (epoch !== generation) return { action: "handled" }
+			if (inputBranchGeneration !== branchGeneration) return { action: "handled" }
+			if (inputEnableGeneration !== enableGeneration) return { action: "continue" }
 			if (errors) toast(ctx, `${changed ? "提示词部分内容未能翻译" : "提示词翻译失败"}，已保留原文；详见 ${LOG_PATH}`)
 			if (!changed || !en.trim()) {
 				seenUserTexts.add(text)
@@ -920,19 +969,25 @@ function toggleShow(ctx: ExtensionContext) {
 			// Only outgoing text is stored; its bilingual display is assembled by the transformer.
 			return { action: "transform", text: en }
 		} catch (err) {
-			if (epoch !== generation) return { action: "handled" }
+			if (inputBranchGeneration !== branchGeneration) return { action: "handled" }
+			if (inputEnableGeneration !== enableGeneration) return { action: "continue" }
 			diag(`outbound error: ${String((err && (err as Error).message) || err).slice(0, 150)}`)
 			return { action: "continue" }
 		}
 	})
 
-	pi.on("session_shutdown", async () => resetBranchState())
+	pi.on("session_shutdown", async () => {
+		resetBranchState()
+		transcriptRenderer = undefined
+	})
 	pi.on("session_tree", async (_event, ctx) => {
 		restoreBranch(ctx)
 		diag("restored tree branch")
 	})
 	pi.on("session_start", async (_event, ctx) => {
+		attachTranscriptRenderer(ctx)
 		restoreBranch(ctx)
+		updateTranslationStatus(ctx)
 		diag(
 			`loaded provider=${cfg.provider} model=${cfg.model} baseUrl=${cfg.baseUrl} ` +
 				`showByDefault=${cfg.showByDefault} outbound=${cfg.outbound} lang=${cfg.lang} toggle=${cfg.toggleKey}`,

@@ -17,7 +17,7 @@ function load(runtime, options = {}) {
     ? implementation.replace('\tloadConfig()', `\tObject.assign(exports, { cfg, ${symbols} });\n\tloadConfig()`)
     : implementation + `\nexport { ${symbols}, scheduleOne, translateBlock };`
   const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
-  const calls = [], notices = [], logs = [], components = [], hooks = new Map(), commands = new Map()
+  const calls = [], notices = [], logs = [], components = [], statuses = new Map(), hooks = new Map(), commands = new Map()
   let transformer
   const answer = options.answer ?? ((text) => `译文：${text}`)
   const fetchMock = async (_url, init) => {
@@ -54,14 +54,26 @@ function load(runtime, options = {}) {
     },
     sessionManager: { getBranch: () => options.branch ?? [] },
     ui: {
+      setWidget: (_key, factory) => factory({
+        invalidate: () => { for (const component of components) component.invalidate() },
+        requestRender() {},
+      }),
+      setStatus: (key, value) => statuses.set(key, value),
       notify: (message) => notices.push(message),
       setHiddenThinkingLabel: (label) => { for (const component of components) component.setHiddenThinkingLabel(label) },
     },
   }
+  const timers = new Set()
   const $ = {
-    model: { complete: async ({ system, prompt }) => ({ isAnswered: true, text: await modelAnswer(system, prompt) }) },
+    clock: { after: (_ms, callback) => {
+      const timer = { callback, cancel: () => timers.delete(timer) }
+      timers.add(timer)
+      return timer
+    } },
+    command: { register: async command => commands.set(command.name, command) },
+    model: { complete: async ({ system, prompt }, options) => ({ isAnswered: true, text: await modelAnswer(system, prompt, options?.signal) }) },
     fs: { write: async (_path, text) => logs.push(text) },
-    ui: { toast: (message) => notices.push(message), invalidate() {} },
+    ui: { toast: (message) => notices.push(message), status: text => statuses.set('sermo-translate', text), invalidate() {} },
     process: { run: async (args) => {
       const body = args[args.indexOf('--data-binary') + 1]
       const response = await fetchMock('mock', { body })
@@ -76,8 +88,11 @@ function load(runtime, options = {}) {
     registerShortcut() {}, registerCommand: (name, command) => commands.set(name, command),
     registerMarkdownTransformer: (fn) => { transformer = fn }, on: (name, handler) => hooks.set(name, handler),
   })
-  else sandbox.exports.register((name, ...args) => hooks.set(name, args.at(-1)), config)
-  return { ...sandbox.exports, hooks, commands, ctx, $, calls, notices, logs, components,
+  else sandbox.exports.register((name, ...args) => {
+    const key = name === 'ui.render' ? `${name}:${args[0].component}` : name
+    hooks.set(key, args.at(-1))
+  }, config)
+  return { ...sandbox.exports, hooks, commands, ctx, $, calls, notices, logs, components, statuses, timers,
     transform: (text, messageType = 'assistant', isStreaming = false) => transformer(text, { messageType, isStreaming, availableWidth: 100 }),
   }
 }
@@ -99,6 +114,92 @@ test('Pi: new config takes precedence and legacy config is read only for ENOENT'
       ? ['/test-agent/sermo-translate.json', '/test-agent/parrot-translate.json']
       : ['/test-agent/sermo-translate.json'])
   }
+})
+
+test('Pi: off stops both translation paths and on resumes them', async () => {
+  const h = load('pi', { answer: text => text === '请检查' ? 'Please check.' : '这是说明。' })
+  await h.hooks.get('session_start')({}, h.ctx)
+  assert.equal(h.statuses.get('sermo-translate'), 'Translation: on')
+  const command = h.commands.get('translate')
+  await command.handler('off', h.ctx)
+  await command.handler('off', h.ctx)
+  assert.equal(await submit('pi', h, '请检查'), '请检查')
+  const message = { role: 'assistant', content: [{ type: 'text', text: 'Here is the explanation.' }] }
+  await h.hooks.get('message_end')({ message }, h.ctx)
+  await flush()
+  assert.equal(h.calls.length, 0)
+  assert.equal(h.statuses.get('sermo-translate'), 'Translation: off')
+  await command.handler('invalid', h.ctx)
+  assert.equal(h.statuses.get('sermo-translate'), 'Translation: off')
+  await command.handler('on', h.ctx)
+  await command.handler('on', h.ctx)
+  assert.equal(await submit('pi', h, '请检查'), 'Please check.')
+  await h.hooks.get('message_end')({ message }, h.ctx)
+  await flush()
+  assert.match(h.transform('Here is the explanation.'), /这是说明/)
+  await command.handler('off', h.ctx)
+  assert.equal(h.transform('Here is the explanation.'), 'Here is the explanation.')
+})
+
+test('Pi: disabling aborts an in-flight rewrite and preserves the original submission', async () => {
+  let finish
+  const h = load('pi', { answer: () => new Promise(resolve => { finish = resolve }) })
+  const input = h.hooks.get('input')({ source: 'interactive', text: '请检查' }, h.ctx)
+  await flush()
+  await h.commands.get('translate').handler('off', h.ctx)
+  assert.equal(h.calls[0].signal.aborted, true)
+  finish('Please check.')
+  assert.equal((await input).action, 'continue')
+  assert.equal(h.calls.length, 1)
+})
+
+test('Pi: branch changes and shutdown cancel pending input even when translation state changes', async () => {
+  for (const eventName of ['session_tree', 'session_shutdown']) {
+    for (const order of ['off-first', 'branch-first']) {
+      let finish
+      const h = load('pi', { config: { provider: 'session' }, answer: () => new Promise(resolve => { finish = resolve }) })
+      await h.hooks.get('session_start')({}, h.ctx)
+      const input = h.hooks.get('input')({ source: 'interactive', text: '请检查' }, h.ctx)
+      await flush()
+      if (order === 'off-first') await h.commands.get('translate').handler('off', h.ctx)
+      await h.hooks.get(eventName)({}, h.ctx)
+      if (order === 'branch-first') await h.commands.get('translate').handler('off', h.ctx)
+      finish('Please check.')
+      assert.equal((await input).action, 'handled', `${eventName}, ${order}: abandoned input must be consumed`)
+      assert.equal(h.calls.length, 1)
+    }
+  }
+})
+
+test('Pi: translation state refreshes cached user and assistant rows at the same width', async () => {
+  const { initTheme } = await import('../pi/node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js')
+  const { UserMessageComponent } = await import('../pi/node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/user-message.js')
+  const { AssistantMessageComponent } = await import('../pi/node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/assistant-message.js')
+  initTheme('dark', false)
+  const h = load('pi', { answer: text => text === '你好' ? 'Hello' : '这是说明。' })
+  await h.hooks.get('session_start')({}, h.ctx)
+  assert.equal(await submit('pi', h, '你好'), 'Hello')
+  const transforms = [(md, ctx) => h.transform(md, ctx.messageType, ctx.isStreaming)]
+  const user = new UserMessageComponent('Hello', undefined, 1, transforms)
+  const message = { role: 'assistant', content: [{ type: 'text', text: 'Here is the explanation.' }] }
+  const assistant = new AssistantMessageComponent(message, false, undefined, 'Custom thinking label', 1, transforms)
+  h.components.push(user, assistant)
+  const render = component => component.render(100).join('\n')
+  assert.match(render(user), /你好/)
+  assert.doesNotMatch(render(assistant), /这是说明/)
+  await h.hooks.get('message_end')({ message }, h.ctx)
+  await flush()
+  assert.match(render(assistant), /这是说明/, 'completion refreshes an already rendered assistant row')
+  await h.commands.get('translate').handler('off', h.ctx)
+  assert.doesNotMatch(render(user), /你好/, 'off invalidates the cached bilingual user row')
+  assert.doesNotMatch(render(assistant), /这是说明/)
+  await h.commands.get('translate').handler('on', h.ctx)
+  assert.match(render(user), /你好/, 'on restores the bilingual user row without resizing')
+  assert.match(render(assistant), /这是说明/)
+  await h.commands.get('translate').handler('', h.ctx)
+  assert.match(render(user), /你好/, 'display toggle only hides assistant translations')
+  assert.doesNotMatch(render(assistant), /这是说明/)
+  assert.equal(h.calls.length, 2, 'render invalidation reuses completed translations')
 })
 
 const flush = async () => { for (let i = 0; i < 4; i++) await new Promise(setImmediate) }
@@ -476,6 +577,7 @@ test('Pi: file references adjoining Chinese prose and paths with punctuation are
 
 test('Pi: intermediate text and thinking render before final message_end', async () => {
   const h = load('pi')
+  await h.hooks.get('session_start')({}, h.ctx)
   const { initTheme } = await import('../pi/node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js')
   initTheme('dark', false)
   const { AssistantMessageComponent } = await import('../pi/node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/assistant-message.js')
@@ -761,6 +863,163 @@ test('Pi: concurrent intermediate replies share a four-request translation limit
   assert.equal(h.calls.length, 12)
   assert.equal(peak, 4)
 })
+
+for (const runtime of ['pi', 'claude']) {
+  test(`${runtime}: display toggle leaves background translation and prompt rewriting enabled`, async () => {
+    let finish
+    const h = load(runtime, { answer: text => text === '请检查' ? 'Please check.' : new Promise(resolve => { finish = resolve }) })
+    const text = 'Here is the explanation.'
+    if (runtime === 'pi') {
+      await h.hooks.get('session_start')({}, h.ctx)
+      await h.hooks.get('message_end')({ message: { role: 'assistant', content: [{ type: 'text', text }] } }, h.ctx)
+    } else {
+      await h.hooks.get('session.start')(h.$, {}, e => e)
+      h.scheduleOne(h.$, text)
+    }
+    await flush()
+    const toggle = () => runtime === 'pi'
+      ? h.commands.get('translate').handler('', h.ctx)
+      : h.hooks.get('command.run')(h.$, { args: '' })
+    const render = () => runtime === 'pi' ? h.transform(text)
+      : h.hooks.get('ui.render:AssistantMessage')(h.$, { props: { text } }, e => e.props.text)
+    await toggle()
+    assert.equal(h.statuses.get('sermo-translate'), 'Translation: on')
+    if (h.calls[0].signal) assert.equal(h.calls[0].signal.aborted, false)
+    finish('这是说明。')
+    await flush()
+    assert.equal(await render(), text)
+    assert.equal(await submit(runtime, h, '请检查'), 'Please check.')
+    await toggle()
+    assert.match(await render(), /这是说明/)
+    assert.equal(h.calls.length, 2)
+  })
+}
+
+test('Claude: off disables both translation paths and cancels debounce; on resumes', async () => {
+  const h = load('claude', { answer: text => text === '请检查' ? 'Please check.' : '这是说明。' })
+  const command = args => h.hooks.get('command.run')(h.$, { args })
+  const render = text => h.hooks.get('ui.render:AssistantMessage')(h.$, { props: { text } }, e => e.props.text)
+  const tick = async () => {
+    for (const timer of [...h.timers]) { h.timers.delete(timer); timer.callback() }
+    await flush()
+  }
+  await h.hooks.get('session.start')(h.$, {}, e => e)
+  assert.equal(h.statuses.get('sermo-translate'), 'Translation: on')
+  await render('Here is the explanation.')
+  assert.equal(h.timers.size, 1)
+  await command('off')
+  await command('off')
+  assert.equal(h.timers.size, 0)
+  assert.equal(await submit('claude', h, '请检查'), '请检查')
+  assert.equal(await render('Here is the explanation.'), 'Here is the explanation.')
+  await tick()
+  assert.equal(h.calls.length, 0)
+  await command('invalid')
+  assert.equal(h.statuses.get('sermo-translate'), 'Translation: off')
+  await command('on')
+  await command('on')
+  assert.equal(await submit('claude', h, '请检查'), 'Please check.')
+  await render('Here is the explanation.')
+  await tick()
+  assert.match(await render('Here is the explanation.'), /这是说明/)
+  await command('')
+  assert.equal(h.statuses.get('sermo-translate'), 'Translation: on')
+  assert.equal(await render('Here is the explanation.'), 'Here is the explanation.')
+  assert.equal(await submit('claude', h, '请检查'), 'Please check.')
+  await command('off')
+  assert.equal(h.statuses.get('sermo-translate'), 'Translation: off')
+  assert.equal(await render('Here is the explanation.'), 'Here is the explanation.')
+  const user = await h.hooks.get('ui.render:UserMessage')(h.$, { props: { text: 'Please check.' } }, e => e.props.text)
+  assert.equal(user, 'Please check.')
+})
+
+for (const provider of ['microsoft', 'session', 'openai']) {
+  test(`Claude/${provider}: disabling discards pending rewrites and prevents further requests`, async () => {
+    let finish
+    const h = load('claude', { config: { provider }, answer: () => new Promise(resolve => { finish = resolve }) })
+    const input = submit('claude', h, '请检查'.repeat(1500))
+    await flush()
+    assert.equal(h.calls.length, 1)
+    await h.hooks.get('command.run')(h.$, { args: 'off' })
+    if (provider === 'session') assert.equal(h.calls[0].signal.aborted, true)
+    await h.hooks.get('command.run')(h.$, { args: 'on' })
+    finish('Untranslated commentary requiring a retry.')
+    assert.equal(await input, '请检查'.repeat(1500))
+    assert.equal(h.calls.length, 1)
+  })
+}
+
+test('Claude: stale replies cannot overwrite fresh translations after re-enabling', async () => {
+  let finish
+  const h = load('claude', { answer: (_text, n) => n === 1 ? new Promise(resolve => { finish = resolve }) : '新的译文。' })
+  const text = 'Here is the explanation.'
+  h.scheduleOne(h.$, text)
+  await flush()
+  await h.hooks.get('command.run')(h.$, { args: 'off' })
+  await h.hooks.get('command.run')(h.$, { args: 'on' })
+  h.scheduleOne(h.$, text)
+  await flush()
+  finish('过期译文。')
+  await flush()
+  const rendered = await h.hooks.get('ui.render:AssistantMessage')(h.$, { props: { text } }, e => e.props.text)
+  assert.match(rendered, /新的译文/)
+  assert.doesNotMatch(rendered, /过期译文/)
+})
+
+test('Claude: translation command can run during an active turn', async () => {
+  const h = load('claude')
+  await h.hooks.get('session.start')(h.$, {}, e => e)
+  assert.equal(h.commands.get('translate').immediate, true)
+})
+
+for (const trigger of ['display', 'enable', 'cancel-retry']) {
+  test(`Claude: ${trigger} retries preserve successful paragraphs`, async () => {
+    const first = 'Here is the first explanation.'
+    const second = 'Here is the second explanation.'
+    const text = `${first}\n\n${second}`
+    let phase = 'initial'
+    let finish
+    const h = load('claude', { answer: source => {
+      source = source.trim()
+      if (source === first && phase === 'initial') return '第一段译文。'
+      if (phase === 'pending') return new Promise(resolve => { finish = resolve })
+      if (phase === 'recovered' && source === second) return '第二段译文。'
+      throw new Error('provider offline')
+    } })
+    const command = args => h.hooks.get('command.run')(h.$, { args })
+    const render = () => h.hooks.get('ui.render:AssistantMessage')(h.$, { props: { text } }, e => e.props.text)
+    h.scheduleOne(h.$, text)
+    await flush()
+    assert.match(await render(), /第一段译文/)
+    phase = 'pending'
+    if (trigger === 'enable') {
+      await command('off')
+      await command('on')
+    } else {
+      await command('')
+      await command('')
+    }
+    await flush()
+    assert.match(await render(), /第一段译文/, 'successful translation remains visible during retry')
+    assert.equal(h.calls.filter(call => call.text.trim() === first).length, 1)
+    if (trigger === 'cancel-retry') {
+      await command('off')
+      phase = 'offline'
+      await command('on')
+    }
+    finish('') // Failed/empty response must not replace the earlier successful paragraph.
+    await flush()
+    assert.match(await render(), /第一段译文/, 'failed or cancelled retry retains previous successes')
+    phase = 'recovered'
+    await command('')
+    await command('')
+    await flush()
+    const result = await render()
+    assert.match(result, /第一段译文/)
+    assert.match(result, /第二段译文/)
+    assert.equal(h.calls.filter(call => call.text.trim() === first).length, 1, 'only failed paragraphs are retried')
+  })
+}
 
 test('Claude: a failed reply records error rather than skip/readiness', async () => {
   const h = load('claude', { answer: () => { throw new Error('provider offline') } })
