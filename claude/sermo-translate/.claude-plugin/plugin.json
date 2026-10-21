@@ -1,6 +1,6 @@
 {
   "name": "sermo-translate",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Translate Claude's replies and outgoing prompts; hotkey toggles reply display, /translate on|off enables or disables translation",
   "author": { "name": "jhao" },
   "userConfig": {

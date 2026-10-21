@@ -1,6 +1,6 @@
 {
 	"name": "sermo-translate-pi",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"private": true,
 	"type": "module",
 	"description": "sermo-translate 的 pi 扩展：回复按需译回配置语言，出站提示词保证英文",
