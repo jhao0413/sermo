@@ -1,1 +1,0 @@
-../../pi/parrot-translate.ts

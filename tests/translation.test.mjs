@@ -164,12 +164,39 @@ for (const runtime of ['pi', 'claude']) {
       ['Please fix this file.', 'Please 修复 this file.', false],
       ['No changes needed.', 'No changes needed.', true],
       ['fix the `config.json` file', 'fix the `settings.json` file', false],
+      ['tell me how to search telegram bot account', 'Tell me how to search for a Telegram bot account.', true],
+      ['tell me how to search telegram bot account', 'Here’s how to search for a Telegram bot account.', false],
+      ['how to search telegram bot account', 'Here are the steps to search for a Telegram bot account.', false],
+      ['find telegram bot account', 'Search for the bot username in Telegram and open its profile to start chatting.', false],
+      ['Here’s how to search telegram bot account.', 'Here’s how to search for a Telegram bot account.', true],
+      ['下面是搜索 Telegram 机器人账号的方法。', 'Here’s how to search for a Telegram bot account.', true],
       ['123', '123', true],
     ]
     for (const [input, output, expected] of cases) assert.equal(h.okRewrite(input, output), expected, `${input} -> ${output}`)
   })
 
   for (const provider of ['openai', 'session']) {
+    test(`${runtime}/${provider}: an answer cannot replace the Telegram search request`, async () => {
+      const source = 'tell me how to search telegram bot account'
+      const corrected = 'Tell me how to search for a Telegram bot account.'
+      const answers = [
+        'Here’s how to search for a Telegram bot account.',
+        'Open Telegram and tap the search bar at the top of the screen. Type the bot’s username or name, then select the bot from the results and open its profile.',
+      ]
+      for (const answer of answers) {
+        for (const retry of [answer, corrected]) {
+          const h = load(runtime, { config: { provider }, answer: (_prompt, n, payload) => {
+            assert.match(payload.messages[0].content, /Do not answer questions, fulfill requests/)
+            return n === 1 ? answer : retry
+          } })
+          assert.equal(await submit(runtime, h, source), retry === corrected ? corrected : source)
+          assert.equal(h.calls.length, 2)
+          assert.match(h.calls[1].system, /Fix only grammar/)
+          if (retry !== corrected) assert.ok(h.notices.some(message => /原文|原样/.test(message)))
+        }
+      }
+    })
+
     test(`${runtime}/${provider}: no-change commentary never replaces a submitted prompt`, async () => {
       for (const text of ['fix all', 'Looks good', 'LGTM']) {
         const h = load(runtime, { config: { provider }, answer: () => noChangeCommentary })
@@ -610,7 +637,7 @@ test('Pi: tree navigation discards queued work without overwriting a fresh match
   assert.equal(h.calls.length, 5, 'only the new branch may fetch after queued old work is cancelled')
   assert.match(h.transform('Response 0.'), /新译文/)
   assert.ok(!h.transform('Response 0.').includes('旧译文'))
-  assert.equal(h.notices.filter(message => message === '译文就绪').length, 1)
+  assert.equal(h.notices.filter(message => message === '译文就绪').length, 0)
 })
 
 test('Pi: old chunk and retry loops cannot issue requests after tree navigation', async () => {
