@@ -1,16 +1,16 @@
 {
-  "name": "pi-parrot-translate",
+  "name": "pi-sermo-translate",
   "version": "0.1.0",
   "description": "Translate Pi replies and thinking, and rewrite outgoing prompts into English.",
   "type": "module",
   "keywords": ["pi-package", "pi-extension", "translation"],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jhao0413/parrot-agent-extensions.git"
+    "url": "git+https://github.com/jhao0413/sermo.git"
   },
-  "files": ["pi/parrot-translate.ts", "pi/README.md"],
+  "files": ["pi/sermo-translate.ts", "pi/README.md"],
   "pi": {
-    "extensions": ["./pi/parrot-translate.ts"]
+    "extensions": ["./pi/sermo-translate.ts"]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

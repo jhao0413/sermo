@@ -1,4 +1,0 @@
-{
-  "description": "parrot-translate hooks module",
-  "modules": ["./register.js"]
-}

@@ -1,4 +1,4 @@
-# parrot-translate (Claude Code)
+# sermo-translate (Claude Code)
 
 写给想用英文跟模型对话的非英语用户。
 
@@ -8,12 +8,12 @@ Claude 的英文回复在后台翻成你配置的语言，`Ctrl+Y` 切换显示�
 
 ## 配置
 
-`/config` 面板可以直接改，或者改 `~/.claude/settings.json`（键名与安装方式对应，marketplace 装的就是 `@parrot-agent-extensions`）：
+`/config` 面板可以直接改，或者改 `~/.claude/settings.json`（键名与安装方式对应，marketplace 装的就是 `@sermo`）：
 
 ```json
 {
   "pluginConfigs": {
-    "parrot-translate@parrot-agent-extensions": {
+    "sermo-translate@sermo": {
       "options": {
         "show_by_default": true,
         "outbound": true,
@@ -40,7 +40,7 @@ Claude 的英文回复在后台翻成你配置的语言，`Ctrl+Y` 切换显示�
 
 provider 三选一：
 
-- `microsoft`：Edge 免费接口，同 parrot 扩展那套，免 key、快。只会翻译，英文输入没有语法检查，会原样放行
+- `microsoft`：Edge 免费接口，同 Glossa 扩展那套，免 key、快。只会翻译，英文输入没有语法检查，会原样放行
 - `session`：`$.model.complete` 走本会话凭证，免配置，质量更好，耗 token。旧值 `model` 仍被接受
 - `openai`：OpenAI 兼容端点，本地 llama.cpp 或远端服务
 
@@ -48,7 +48,7 @@ provider 三选一：
 
 ```json
 "pluginConfigs": {
-  "parrot-translate@parrot-agent-extensions": {
+  "sermo-translate@sermo": {
     "options": {
       "provider": "openai",
       "model": "index-translate-2b",
@@ -69,7 +69,7 @@ provider 三选一：
 
 粘贴的技术性内容会自动识别、原样放行：错误信息、堆栈、JSON、日志、diff（两侧都适用，回复侧同样不送翻）；俄文、阿拉伯文等 Unicode 正文正常翻译。反引号或 `~~~` 围栏（包括更长、未闭合的围栏）及缩进代码块在结构层保护，列表和引用里的代码同样保护；列表续段按容器内的相对缩进识别为正文。超长段落切成 ≤3000 字符的块再送，保留原有分隔符；每块独立检测语言，英文前缀不会让后面的外文跳过。输出被截断时视为失败、放行原文。
 
-只拦本机敲 Enter 的提交（`origin.kind === 'composer'`）；斜杠命令、插件、peer、通知的提交不碰。原来做手动检查的 parrot-grammar 已退役，被这条链路取代。
+只拦本机敲 Enter 的提交（`origin.kind === 'composer'`）；斜杠命令、插件、peer、通知的提交不碰。原来做手动检查的 sermo-grammar 已退役，被这条链路取代。
 
 屏幕上的对照是「原文在上、实际发出的英文引用在下」，`Ctrl+Y` 管不到它，那个键只管回复侧。`session` / `openai` 的改写提示词会带上 `lang` 作为作者语言背景，帮模型译得更地道；出站目标始终是英文，不随 `lang` 变。
 
@@ -96,6 +96,6 @@ provider 三选一：
 
 ## 卸载
 
-- marketplace 装的：`claude plugin uninstall parrot-translate@parrot-agent-extensions`
-- 从 `~/.claude/settings.json` 的 `pluginConfigs` 删掉 `parrot-translate@parrot-agent-extensions`（如有）；`claude plugin marketplace remove parrot-agent-extensions` 移除源
-- 从 `~/.claude/keybindings.json` 删掉 `ctrl+y` 一行；删掉 `pluginConfigs` 里的 `parrot-translate@parrot-agent-extensions`（如有）
+- marketplace 装的：`claude plugin uninstall sermo-translate@sermo`
+- 从 `~/.claude/settings.json` 的 `pluginConfigs` 删掉 `sermo-translate@sermo`（如有）；`claude plugin marketplace remove sermo` 移除源
+- 从 `~/.claude/keybindings.json` 删掉 `ctrl+y` 一行；删掉 `pluginConfigs` 里的 `sermo-translate@sermo`（如有）

@@ -10,11 +10,11 @@ const symbols = 'okRewrite, splitParas, chunkParagraph, ensureEnglishProse, tran
 
 function load(runtime, options = {}) {
   const config = { provider: 'openai', toggle_key: '', ...options.config }
-  const filename = new URL(runtime === 'pi' ? '../pi/parrot-translate.ts' : '../claude/parrot-translate/hooks/register.js', import.meta.url)
+  const filename = new URL(runtime === 'pi' ? '../pi/sermo-translate.ts' : '../claude/sermo-translate/hooks/register.js', import.meta.url)
   const implementation = readFileSync(filename, 'utf8')
   // Pi helpers live inside the per-session extension closure; expose them only in this test sandbox.
   const source = runtime === 'pi'
-    ? implementation.replace('\tloadConfig()', `\tObject.assign(exports, { ${symbols} });\n\tloadConfig()`)
+    ? implementation.replace('\tloadConfig()', `\tObject.assign(exports, { cfg, ${symbols} });\n\tloadConfig()`)
     : implementation + `\nexport { ${symbols}, scheduleOne, translateBlock };`
   const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
   const calls = [], notices = [], logs = [], components = [], hooks = new Map(), commands = new Map()
@@ -33,7 +33,7 @@ function load(runtime, options = {}) {
   const sandbox = {
     exports: {}, URLSearchParams, AbortSignal, AbortController, fetch: fetchMock,
     require: (id) => id === '@earendil-works/pi-coding-agent' ? { getAgentDir: () => '/test-agent' }
-      : id === 'node:fs' ? { readFileSync: () => JSON.stringify(config) }
+      : id === 'node:fs' ? { readFileSync: options.readConfig ?? (() => JSON.stringify(config)) }
       : id === 'node:fs/promises' ? { writeFile: async (_path, text) => logs.push(text) } : require(id),
   }
   vm.runInNewContext(code, sandbox, { filename: filename.pathname })
@@ -82,6 +82,25 @@ function load(runtime, options = {}) {
   }
 }
 
+test('Pi: new config takes precedence and legacy config is read only for ENOENT', () => {
+  for (const failure of [null, 'ENOENT', 'EACCES', 'malformed']) {
+    const paths = []
+    const h = load('pi', { readConfig: path => {
+      paths.push(path)
+      if (path.endsWith('/sermo-translate.json')) {
+        if (failure === 'malformed') return '{'
+        if (failure) throw Object.assign(new Error(failure), { code: failure })
+        return JSON.stringify({ lang: 'ja' })
+      }
+      return JSON.stringify({ lang: 'fr' })
+    } })
+    assert.equal(h.cfg.lang, failure === null ? 'ja' : failure === 'ENOENT' ? 'fr' : 'zh-Hans')
+    assert.deepEqual(paths, failure === 'ENOENT'
+      ? ['/test-agent/sermo-translate.json', '/test-agent/parrot-translate.json']
+      : ['/test-agent/sermo-translate.json'])
+  }
+})
+
 const flush = async () => { for (let i = 0; i < 4; i++) await new Promise(setImmediate) }
 const context = (runtime, h) => runtime === 'pi' ? h.ctx : h.$
 const noChangeCommentary = 'The prompt is already in natural, grammatically correct English. No changes are needed.'
@@ -111,10 +130,10 @@ for (const runtime of ['pi', 'claude']) {
   test(`${runtime}: missing, changed, duplicated or reordered reference placeholders fall back safely`, async () => {
     const source = '请检查 @src/登录.ts 和 @src/app.ts'
     for (const corrupt of [
-      text => text.replace(/`PARROT_FILE_REF_0`/, ''),
-      text => text.replace('PARROT_FILE_REF_0', 'PARROT_FILE_REF_99'),
-      text => text + ' `PARROT_FILE_REF_0`',
-      text => text.replace('PARROT_FILE_REF_0', 'TEMP').replace('PARROT_FILE_REF_1', 'PARROT_FILE_REF_0').replace('TEMP', 'PARROT_FILE_REF_1'),
+      text => text.replace(/`SERMO_FILE_REF_0`/, ''),
+      text => text.replace('SERMO_FILE_REF_0', 'SERMO_FILE_REF_99'),
+      text => text + ' `SERMO_FILE_REF_0`',
+      text => text.replace('SERMO_FILE_REF_0', 'TEMP').replace('SERMO_FILE_REF_1', 'SERMO_FILE_REF_0').replace('TEMP', 'SERMO_FILE_REF_1'),
     ]) {
       const h = load(runtime, { answer: text => corrupt(text.replace('请检查', 'Please review').replace(' 和 ', ' and ')) })
       assert.equal(await submit(runtime, h, source), source)
@@ -122,11 +141,11 @@ for (const runtime of ['pi', 'claude']) {
   })
 
   test(`${runtime}: reference masking avoids collisions and preserves punctuation and email text`, async () => {
-    const source = '请检查 @src/app.ts. (contact user@example.com) PARROT_FILE_REF_0'
+    const source = '请检查 @src/app.ts. (contact user@example.com) SERMO_FILE_REF_0'
     const h = load(runtime, { answer: text => text.replace('请检查', 'Please review') })
     assert.equal(await submit(runtime, h, source), source.replace('请检查', 'Please review'))
     assert.ok(h.calls[0].text.includes('user@example.com'))
-    assert.ok(h.calls[0].text.includes(runtime === 'pi' ? '`_PARROT_FILE_REF_0`' : '`_PARROT_FILE_REF_0`.'))
+    assert.ok(h.calls[0].text.includes(runtime === 'pi' ? '`_SERMO_FILE_REF_0`' : '`_SERMO_FILE_REF_0`.'))
   })
 
   test(`${runtime}: references stay intact across long prompt chunks`, async () => {
@@ -407,7 +426,7 @@ for (const runtime of ['pi', 'claude']) {
 
 test('Pi: a placeholder split at the request limit cannot escape into the submitted prompt', async () => {
   const source = '请'.repeat(2995) + '@src/登录.ts'
-  const h = load('pi', { answer: text => text.replaceAll('请', 'Review ').replace('`PARR', 'BROKEN') })
+  const h = load('pi', { answer: text => text.replaceAll('请', 'Review ').replace('`SERM', 'BROKEN') })
   assert.ok(await submit('pi', h, source) === source, 'a damaged split marker must fall back to the original')
   assert.ok(h.calls.length > 1)
   assert.ok(h.calls.every(call => !call.text.includes('@src/登录.ts')))
@@ -427,9 +446,9 @@ test('Pi: retries preserve masked references and restore them after a valid rewr
 test('Pi: reference placeholders cannot acquire quotes or leak extra markers', async () => {
   const source = '请检查 @src/登录.ts'
   for (const corrupt of [
-    text => text.replace('`PARROT_FILE_REF_0`', '"`PARROT_FILE_REF_0`"'),
-    text => text.replace('`PARROT_FILE_REF_0`', '``PARROT_FILE_REF_0``'),
-    text => text + ' PARROT_FILE_REF_99',
+    text => text.replace('`SERMO_FILE_REF_0`', '"`SERMO_FILE_REF_0`"'),
+    text => text.replace('`SERMO_FILE_REF_0`', '``SERMO_FILE_REF_0``'),
+    text => text + ' SERMO_FILE_REF_99',
   ]) {
     const h = load('pi', { answer: text => corrupt(text.replace('请检查', 'Please review')) })
     assert.equal(await submit('pi', h, source), source)

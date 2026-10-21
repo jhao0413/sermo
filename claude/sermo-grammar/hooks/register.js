@@ -1,5 +1,5 @@
 /**
- * parrot-grammar — 检查输入框里的英文，并给出更自然的写法。
+ * sermo-grammar — 检查输入框里的英文，并给出更自然的写法。
  *
  * 手动触发：/grammar 命令，或把键位绑到 command:grammar（见 README）。
  *
@@ -8,7 +8,7 @@
  * 不需要额外的 API key，也不占用对话上下文。
  */
 
-const PANE = 'parrot-grammar'
+const PANE = 'sermo-grammar'
 const MODEL = 'haiku' // 便宜、快；够做语法判断
 const MAX_TOKENS = 2000
 const TIMEOUT_MS = 30_000
@@ -76,7 +76,7 @@ async function check($, draft) {
 /** 没有面板可用时（-p、SDK、Desktop 不支持 pane）退回纯文本报告。 */
 function formatReport(draft, result) {
   const { ok, corrected, issues = [], terms = [] } = result
-  const lines = ['parrot-grammar']
+  const lines = ['sermo-grammar']
   if (ok && issues.length === 0 && terms.length === 0) lines.push('✓ No grammar issues.')
   for (const it of issues) lines.push(`- ${it.wrong} → ${it.right}  (${it.why})`)
   for (const t of terms) lines.push(`- ${t.zh} → ${t.en.join(' / ')}${t.note ? '  ' + t.note : ''}`)
@@ -89,7 +89,7 @@ async function run($, e) {
   const read = (await $.prompt.read()).text
   const draft = (e.args || '').trim() || (read && !read.startsWith('/') ? read : '') || lastDraft
   if (!draft.trim()) {
-    $.ui.toast('parrot-grammar: the prompt box is empty — write something first')
+    $.ui.toast('sermo-grammar: the prompt box is empty — write something first')
     return {}
   }
 
@@ -101,7 +101,7 @@ async function run($, e) {
     // A pane only gets the keyboard while the composer is empty, so move the
     // draft out of the box first. state.draft keeps it until we put it back.
     await $.prompt.fill({ text: '', mode: 'replace' })
-    await $.ui.open({ id: PANE, title: 'parrot · English check', focus: true, closeOnEscape: true })
+    await $.ui.open({ id: PANE, title: 'Sermo · English check', focus: true, closeOnEscape: true })
     focused = (await $.ui.panes()).some((p) => p.id === PANE && p.isFocused)
     // No focus (narrow terminal, or the pane was refused): never leave the box empty.
     if (!focused) await $.prompt.fill({ text: draft, mode: 'replace' })
@@ -120,7 +120,7 @@ async function run($, e) {
 
   // 没有可视界面（-p / SDK）：把报告当文本返回，让 headless 也能用
   if (headless) {
-    return { text: error ? `parrot-grammar: ${error}` : formatReport(draft, result) }
+    return { text: error ? `sermo-grammar: ${error}` : formatReport(draft, result) }
   }
 
   $.ui.invalidate('ui.render')
@@ -263,7 +263,7 @@ export function register(on) {
       return await run($, e)
     } catch (err) {
       // 不让错误静默：命令 hook 抛错会被跳过，什么都看不到
-      return { text: 'parrot-grammar error: ' + (err instanceof Error ? err.message : String(err)) }
+      return { text: 'sermo-grammar error: ' + (err instanceof Error ? err.message : String(err)) }
     }
   })
 

@@ -1,5 +1,5 @@
 {
-  "name": "parrot-translate",
+  "name": "sermo-translate",
   "version": "0.1.0",
   "description": "Translate Claude's English replies into the configured language (hotkey toggles); ensure outgoing prompts are natural English (translate or grammar-fix), shown bilingually",
   "author": { "name": "jhao" },

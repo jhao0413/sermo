@@ -1,13 +1,13 @@
 {
-  "name": "parrot-agent-extensions",
+  "name": "sermo",
   "owner": {
     "name": "jhao"
   },
   "plugins": [
     {
-      "name": "parrot-translate",
-      "source": "./claude/parrot-translate"
+      "name": "sermo-translate",
+      "source": "./claude/sermo-translate"
     }
   ],
-  "description": "给编码 agent 的语言辅助扩展：parrot-translate 保证出站 prompt 是地道英文、回复按需译回配置语言"
+  "description": "给编码 agent 的语言辅助扩展：sermo-translate 保证出站 prompt 是地道英文、回复按需译回配置语言"
 }

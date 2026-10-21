@@ -1,5 +1,5 @@
 /**
- * parrot-translate — Claude 的英文回复自动翻成配置的目标语言；发出的提示词保证是地道英文。
+ * sermo-translate — Claude 的英文回复自动翻成配置的目标语言；发出的提示词保证是地道英文。
  *
  * 行为：回复稳定约 1.5s 后后台翻好缓存；快捷键（Ctrl+Y）切换显示。
  * 逐段穿插：每段原文下面直接跟它自己的 `> ` 译文。
@@ -8,7 +8,7 @@
  * 粘贴的技术性内容（错误信息/堆栈/JSON/日志/diff）两侧都不送翻，原样放行。
  *
  * 翻译服务（/config 里换，见 plugin.json 的 userConfig）：
- *  - microsoft（默认）：Edge 免费接口（与 parrot 扩展同款），无需 key
+ *  - microsoft（默认）：Edge 免费接口（与 Glossa 扩展同款），无需 key
  *  - session：$.model.complete 走本会话凭证跑一次独立补全（默认 haiku），免配置、质量更好、耗 token
  *
  * 注：hooks module 只能 import 相对路径和 "claude-code"，所以没有外部依赖。
@@ -69,7 +69,7 @@ const langName = () => LANG_NAMES[cfg.lang] ?? cfg.lang
 const sameLang = (a, b) =>
   !!a && !!b && String(a).toLowerCase().split('-')[0] === String(b).toLowerCase().split('-')[0]
 
-/* ---------------- 微软（Edge 免费接口，同 parrot microsoft.ts） ---------------- */
+/* ---------------- 微软（Edge 免费接口，同 Glossa microsoft.ts） ---------------- */
 
 /* 宿主有时会把 JSON 响应预解析成对象塞进 text（类型声明说是 string，别信）；两头都兼容 */
 function parseBody(res) {
@@ -515,7 +515,7 @@ const OUT_GRAMMAR_RETRY_SYSTEM = () =>
 
 /** Hide file mentions from providers, including quoted paths containing spaces. */
 function protectFileReferences(text) {
-  let prefix = 'PARROT_FILE_REF_'
+  let prefix = 'SERMO_FILE_REF_'
   while (text.includes(prefix)) prefix = '_' + prefix
   const refs = []
   const masked = text.replace(/(?<![\p{L}\p{N}_@])@(?:"(?:\\.|[^"\r\n])*"|'(?:\\.|[^'\r\n])*'|[^\s`"'<>()[\]{},;!?，。；！？、]+)/gu, (match) => {
@@ -662,7 +662,7 @@ export function register(on, options) {
   cache.clear()
   outboundMap.clear()
 
-  // userConfig（/config 面板或 settings.json 的 pluginConfigs["parrot-translate@inline"]）
+  // userConfig（/config 面板或 settings.json 的 pluginConfigs["sermo-translate@inline"]）
   cfg.showByDefault = options?.show_by_default !== false // 默认 true（0.4.3 起）
   cfg.outbound = options?.outbound !== false
   cfg.lang = typeof options?.lang === 'string' && options.lang.trim() ? options.lang.trim() : 'zh-Hans'

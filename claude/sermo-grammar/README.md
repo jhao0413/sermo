@@ -1,6 +1,6 @@
-# parrot-grammar (Claude Code)
+# sermo-grammar (Claude Code)
 
-> 已废弃：parrot-translate v0.4.3 起在提交时自动完成「外语→英文 + 英文修语法」（见同仓库 parrot-translate 的「出站」一节），本插件已从 `CLAUDE_CODE_PLUGIN_DIRS` 和 `keybindings.json` 移除，代码留作参考。`Ctrl+G` 恢复为 Claude Code 默认的外部编辑器。
+> 已废弃：sermo-translate v0.4.3 起在提交时自动完成「外语→英文 + 英文修语法」（见同仓库 sermo-translate 的「出站」一节），本插件已从 `CLAUDE_CODE_PLUGIN_DIRS` 和 `keybindings.json` 移除，代码留作参考。`Ctrl+G` 恢复为 Claude Code 默认的外部编辑器。
 
 检查**输入框里的英文**，指出语法问题，并给出更自然的写法。手动触发，结果可直接替换回输入框。
 
@@ -15,7 +15,7 @@
 ```json
 {
   "env": {
-    "CLAUDE_CODE_PLUGIN_DIRS": "/Users/jhao/Projects/parrot/integrations/claude-grammar"
+    "CLAUDE_CODE_PLUGIN_DIRS": "/Users/jhao/Projects/sermo/claude/sermo-grammar"
   }
 }
 ```
@@ -23,7 +23,7 @@
 **2. 单次会话加载**（开发时改代码会热重载）：
 
 ```bash
-claude --plugin-dir ~/Projects/parrot/integrations/claude-grammar
+claude --plugin-dir ~/Projects/sermo/claude/sermo-grammar
 ```
 
 ## 用法
@@ -87,7 +87,7 @@ Claude Code 的 mods API 提供了三个刚好够用的能力，不需要额外�
 ## 文件
 
 ```
-integrations/claude-grammar/
+claude/sermo-grammar/
 ├── .claude-plugin/
 │   ├── plugin.json          # 插件清单
 │   └── types/               # Claude Code 自动生成的 mods API 类型（勿手改）
@@ -100,7 +100,7 @@ integrations/claude-grammar/
 ## 校验与调试
 
 ```bash
-claude plugin validate ./integrations/claude-grammar   # 静态检查
+claude plugin validate ./claude/sermo-grammar   # 静态检查
 claude --debug                                          # 看 keybindings / mod 加载错误
 ```
 

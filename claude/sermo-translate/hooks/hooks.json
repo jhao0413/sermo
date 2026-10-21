@@ -1,0 +1,4 @@
+{
+  "description": "sermo-translate hooks module",
+  "modules": ["./register.js"]
+}

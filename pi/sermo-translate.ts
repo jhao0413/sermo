@@ -1,7 +1,7 @@
 /**
- * parrot-translate (pi) — 回复和思考内容翻成目标语言；提示词发出前改写成英文。
+ * sermo-translate (pi) — 回复和思考内容翻成目标语言；提示词发出前改写成英文。
  *
- * 行为对齐 claude/parrot-translate：
+ * 行为对齐 claude/sermo-translate：
  *  - 回复：完成的文本/思考块即后台翻译并缓存，Ctrl+Y / /translate 切换显示，
  *    逐段穿插：每段原文下面直接跟它自己的 `> ` 译文。译文只改渲染层（registerMarkdownTransformer），
  *    会话存储与模型上下文不受显示译文影响。
@@ -9,7 +9,7 @@
  *    （外文忠实翻译；英文只修语法，不改意思）；屏幕上的用户行渲染成「原文在上、英文引用在下」的双语对照。
  *  - 粘贴的技术性内容（错误信息/堆栈/JSON/日志/diff）两侧都不送翻，原样放行；``` 围栏在结构层就不送翻。
  *
- * 翻译服务（~/.pi/agent/parrot-translate.json，见 README）：
+ * 翻译服务（~/.pi/agent/sermo-translate.json，见 README）：
  *  - microsoft（默认）：Edge 免费接口，无需 key
  *  - session：本会话凭证跑一次独立补全（ctx.modelRegistry.complete，默认 haiku），免配置、质量更好、耗 token
  *  - openai：OpenAI 兼容端点（本地 llama.cpp 等）
@@ -26,12 +26,13 @@ const MODEL_TIMEOUT = 60_000 // session 补全超时（本地/慢模型长文可
 const MS_TIMEOUT = 30_000
 const OPENAI_TIMEOUT = 120_000
 const MAP_CAP = 500 // cache / outboundMap 条目上限（FIFO 淘汰最旧，防长会话无限增长）
-const LOG_PATH = "/tmp/parrot-pi.log"
-const CONFIG_PATH = join(getAgentDir(), "parrot-translate.json")
+const LOG_PATH = "/tmp/sermo-pi.log"
+const CONFIG_PATH = join(getAgentDir(), "sermo-translate.json")
+const LEGACY_CONFIG_PATH = join(getAgentDir(), "parrot-translate.json")
 
 // Pi can initialize this module for multiple sessions in the same process.
 // Keep each session's configuration, caches and cancellation state in its own closure.
-export default function parrotTranslate(pi: ExtensionAPI) {
+export default function sermoTranslate(pi: ExtensionAPI) {
 
 /** 配置（加载时从 CONFIG_PATH 读；改完 /reload 生效） */
 const cfg = {
@@ -93,7 +94,14 @@ function putCapped<K, V>(map: Map<K, V>, key: K, val: V) {
 
 function loadConfig() {
 	try {
-		const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf8"))
+		let text: string
+		try {
+			text = readFileSync(CONFIG_PATH, "utf8")
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err
+			text = readFileSync(LEGACY_CONFIG_PATH, "utf8")
+		}
+		const raw = JSON.parse(text)
 		if (typeof raw !== "object" || raw === null) return
 		cfg.showByDefault = typeof raw.show_by_default === "boolean" ? raw.show_by_default : true
 		cfg.outbound = typeof raw.outbound === "boolean" ? raw.outbound : true
@@ -580,7 +588,7 @@ const OUT_GRAMMAR_WRAP = (chunk: string) =>
 
 /** Hide file mentions from providers, including quoted paths containing spaces. */
 function protectFileReferences(text: string) {
-	let prefix = 'PARROT_FILE_REF_'
+	let prefix = 'SERMO_FILE_REF_'
 	while (text.includes(prefix)) prefix = '_' + prefix
 	const refs: { token: string; ref: string; before: string; after: string }[] = []
 	const quoteAt = (source: string, index: number) => /[`"'“”‘’]/.test(source[index] ?? "") ? source[index] : ""
@@ -825,7 +833,7 @@ function toggleShow(ctx: ExtensionContext) {
 	// 粘贴删除文本键，介意者在配置里换 toggle_key 或留空禁用，/translate 始终可用）
 	if (cfg.toggleKey) {
 		pi.registerShortcut(cfg.toggleKey as KeyId, {
-			description: "Show/hide parrot translations",
+			description: "Show/hide Sermo translations",
 			handler: (ctx) => toggleShow(ctx),
 		})
 	}

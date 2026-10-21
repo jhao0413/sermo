@@ -1,9 +1,9 @@
 {
-	"name": "parrot-translate-pi",
+	"name": "sermo-translate-pi",
 	"version": "0.1.0",
 	"private": true,
 	"type": "module",
-	"description": "parrot-translate 的 pi 扩展：回复按需译回配置语言，出站提示词保证英文",
+	"description": "sermo-translate 的 pi 扩展：回复按需译回配置语言，出站提示词保证英文",
 	"scripts": {
 		"check": "tsc --noEmit",
 		"test": "node --test ../tests/translation.test.mjs"
