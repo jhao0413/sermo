@@ -9,15 +9,16 @@ async function load(provider, answer) {
   // Import separate module instances, as Claude does for separate hook environments.
   const { register } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}#${instance++}`)
   const hooks = new Map()
-  const calls = []
-  const request = async text => {
+  const calls = [], signals = [], notices = []
+  const request = async (text, signal) => {
     calls.push(text)
-    return answer(text)
+    signals.push(signal)
+    return answer(text, calls.length)
   }
   const $ = {
-    ui: { toast() {}, status() {}, invalidate() {} },
+    ui: { toast: message => notices.push(message), status() {}, invalidate() {} },
     fs: { write: async () => {} },
-    model: { complete: async ({ prompt }, { signal }) => ({ isAnswered: true, text: await request(prompt), signal }) },
+    model: { complete: async ({ prompt }, { signal }) => ({ isAnswered: true, text: await request(prompt, signal) }) },
     process: { run: async args => {
       const payload = JSON.parse(args[args.indexOf('--data-binary') + 1])
       return { exitCode: 0, stdout: JSON.stringify({ choices: [{ message: { content: await request(payload.messages.at(-1).content) } }] }) }
@@ -28,9 +29,14 @@ async function load(provider, answer) {
     hooks.set(name === 'ui.render' ? `${name}:${args[0].component}` : name, args.at(-1))
   }, { provider })
   return {
-    calls,
+    calls, signals, notices,
     command: args => hooks.get('command.run')($, { args }),
-    submit: text => hooks.get('prompt.submit')($, { text }, e => e.text),
+    submit: async (text, signal) => {
+      const next = Object.assign(e => ({ text: e.text }), { signal })
+      const result = await hooks.get('prompt.submit')($, { text }, next)
+      assert.ok(result && (typeof result.text === 'string' || typeof result.drop === 'string'))
+      return typeof result.drop === 'string' ? result : result.text
+    },
   }
 }
 
@@ -39,6 +45,38 @@ for (const provider of ['session', 'openai', 'microsoft']) {
     const h = await load(provider, () => 'Please review this change.')
     assert.equal(await h.submit('请检查这个修改。'), 'Please review this change.')
     assert.equal(h.calls.length, 1)
+  })
+
+  for (const response of ['failure', 'valid', 'invalid']) {
+    test(`${provider}: an interrupted submission stops retries and ignores ${response} responses`, { timeout: 1000 }, async () => {
+      let resolveRequest, rejectRequest
+      const h = await load(provider, (_text, n) => {
+        assert.equal(n, 1, 'an interrupted request must never be retried')
+        return new Promise((resolve, reject) => {
+          resolveRequest = resolve
+          rejectRequest = reject
+        })
+      })
+      const submission = new AbortController()
+      const pending = h.submit('请检查这个修改。'.repeat(500), submission.signal)
+      assert.equal(h.calls.length, 1)
+      submission.abort(new Error('submission interrupted'))
+      if (provider === 'session') assert.equal(h.signals[0].aborted, true)
+      if (response === 'failure') rejectRequest(new Error('request aborted'))
+      else resolveRequest(response === 'valid' ? 'Please review this change.' : '仍然只是中文。')
+      assert.match((await pending).drop, /取消/)
+      assert.equal(h.calls.length, 1, 'interruption must prevent retries, validation requests and subsequent chunks')
+      assert.ok(!h.notices.some(message => message.includes('失败')), 'user cancellation must not report a provider failure')
+    })
+  }
+
+  test(`${provider}: an already interrupted submission never starts a request`, async () => {
+    const h = await load(provider, () => 'Please review this change.')
+    const submission = new AbortController()
+    submission.abort()
+    assert.match((await h.submit('请检查这个修改。', submission.signal)).drop, /取消/)
+    assert.equal(h.calls.length, 0)
+    assert.deepEqual(h.notices, [])
   })
 
   test(`${provider}: off/on prevents stale work from starting another chunk or retry`, async () => {
@@ -68,10 +106,10 @@ test('session: off aborts the model request signal', async () => {
     } },
   }
   register((name, ...args) => hooks.set(name, args.at(-1)), { provider: 'session' })
-  const pending = hooks.get('prompt.submit')($, { text: '请检查。' }, e => e.text)
+  const pending = hooks.get('prompt.submit')($, { text: '请检查。' }, e => ({ text: e.text }))
   assert.equal(signal.aborted, false)
   await hooks.get('command.run')($, { args: 'off' })
   assert.equal(signal.aborted, true)
   release({ isAnswered: true, text: 'Please review.' })
-  assert.equal(await pending, '请检查。')
+  assert.equal((await pending).text, '请检查。')
 })

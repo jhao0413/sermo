@@ -202,6 +202,148 @@ test('Pi: translation state refreshes cached user and assistant rows at the same
   assert.equal(h.calls.length, 2, 'render invalidation reuses completed translations')
 })
 
+for (const runtime of ['pi', 'claude']) {
+  for (const provider of ['microsoft', 'openai', 'session']) {
+    for (const lateResponse of ['success', 'failure', 'invalid']) {
+      test(`${runtime}/${provider}: terminal failure cancels pending and queued paragraphs before late ${lateResponse}`, { timeout: 2000 }, async () => {
+        const releases = []
+        let released = false
+        const h = load(runtime, { config: { provider }, answer: text => {
+          if (text.includes('检查')) throw new Error('provider offline')
+          if (released) return { out: 'Please explain the cause.', from: 'zh-Hans' }
+          return new Promise((resolve, reject) => releases.push({ resolve, reject }))
+        } })
+        const longParagraph = '请解释错误原因。'.repeat(500)
+        const source = ['请检查这些修改', longParagraph, longParagraph, longParagraph, '请说明结果', '请总结原因'].join('\n\n')
+        let settled = false
+        const pending = submit(runtime, h, source).then(result => {
+          settled = true
+          return result
+        })
+        try {
+          await flush()
+          assert.equal(settled, true, 'cancellation must not wait for sibling requests to return')
+          assert.equal(await pending, undefined)
+          assert.equal(h.calls.filter(call => call.text.includes('检查')).length, 4)
+          assert.equal(releases.length, 3, 'queued paragraphs must never start')
+          assert.equal(h.calls.length, 7)
+          assert.equal(h.notices.filter(message => message.includes('失败')).length, 1)
+          if (runtime === 'pi' || provider === 'session') {
+            for (const call of h.calls.filter(call => !call.text.includes('检查'))) {
+              assert.equal(call.signal.aborted, true, 'supported sibling requests must be aborted')
+            }
+          }
+        } finally {
+          released = true
+          for (const request of releases) {
+            if (lateResponse === 'failure') request.reject(new Error('late request failure'))
+            else request.resolve({ out: lateResponse === 'success' ? 'Please explain the cause.' : '仍然只是中文。', from: 'zh-Hans' })
+          }
+          await pending
+          await flush()
+        }
+        assert.equal(h.calls.length, 7, 'late results cannot start another chunk, validation request or retry')
+        assert.equal(h.notices.filter(message => message.includes('失败')).length, 1)
+        if (runtime === 'pi') assert.equal(h.transform('Please explain the cause.', 'user'), 'Please explain the cause.')
+      })
+    }
+    test(`${runtime}/${provider}: terminal failure leaves other submissions and reply translation active`, { timeout: 2000 }, async () => {
+      const requests = []
+      const h = load(runtime, { config: { provider }, answer: text => {
+        if (text.includes('检查')) throw new Error('provider offline')
+        return new Promise(resolve => requests.push({ text: text.trim(), resolve }))
+      } })
+      const reply = h.translateProse(context(runtime, h), 'An independent reply.')
+      const other = submit(runtime, h, '请说明其他修改')
+      const failed = submit(runtime, h, '请检查这些修改\n\n请解释错误原因')
+      try {
+        await flush()
+        assert.ok(h.notices.some(message => message.includes('已取消发送')))
+        assert.equal(await failed, undefined)
+        if (runtime === 'pi' || provider === 'session') {
+          const independent = h.calls.filter(call => ['An independent reply.', '请说明其他修改'].includes(call.text.trim()))
+          assert.equal(independent.length, 2)
+          assert.ok(independent.every(call => !call.signal.aborted), 'submission failure must not abort shared lifecycle state')
+        }
+      } finally {
+        for (const request of requests) {
+          request.resolve(request.text === 'An independent reply.'
+            ? { out: '这是独立回复。', from: 'en' }
+            : { out: 'Please describe the other changes.', from: 'zh-Hans' })
+        }
+      }
+      assert.equal(await reply, '这是独立回复。')
+      assert.equal(await other, 'Please describe the other changes.')
+      await flush()
+    })
+
+    for (const failures of [1, 3, 4]) {
+      test(`${runtime}/${provider}: outbound request recovers or cancels after ${failures} failures`, async () => {
+        const h = load(runtime, { config: { provider }, answer: (_text, n) => {
+          if (n <= failures) throw new Error('provider offline')
+          return { out: 'Please review these changes.', from: 'zh-Hans' }
+        } })
+        let sent
+        if (runtime === 'pi') {
+          const result = await h.hooks.get('input')({ source: 'interactive', text: '请检查这些修改' }, h.ctx)
+          assert.equal(result.action, failures === 4 ? 'handled' : 'transform')
+          if (result.action === 'transform') sent = result.text
+        } else {
+          const submission = await submitClaude(h, '请检查这些修改')
+          sent = submission.sent
+          if (failures === 4) assert.match(submission.result.drop, /已取消发送/)
+        }
+        assert.equal(h.calls.length, Math.min(failures + 1, 4))
+        assert.equal(sent, failures === 4 ? undefined : 'Please review these changes.')
+        assert.equal(h.notices.some(message => message.includes('已取消发送')), failures === 4)
+      })
+    }
+  }
+
+  test(`${runtime}: a failed paragraph cancels the entire message`, async () => {
+    const h = load(runtime, { answer: text => {
+      if (text.includes('解释')) throw new Error('provider offline')
+      return 'Please review these changes.'
+    } })
+    const text = '请检查这些修改\n\n请解释原因'
+    if (runtime === 'pi') {
+      assert.equal((await h.hooks.get('input')({ source: 'interactive', text }, h.ctx)).action, 'handled')
+      assert.equal(h.transform('Please review these changes.', 'user'), 'Please review these changes.')
+    } else {
+      const submission = await submitClaude(h, text)
+      assert.equal(submission.sent, undefined)
+      assert.match(submission.result.drop, /已取消发送/)
+    }
+    assert.ok(h.notices.some(message => message.includes('已取消发送')))
+  })
+}
+
+test('Claude: an unexpected outbound exception returns a valid drop result', async () => {
+  const h = load('claude')
+  const notify = h.$.ui.toast
+  h.$.ui.toast = message => {
+    if (message.includes('正在')) throw new Error('progress notification failed')
+    notify(message)
+  }
+  const submission = await submitClaude(h, '请检查这些修改'.repeat(20))
+  assert.equal(submission.sent, undefined)
+  assert.match(submission.result.drop, /已取消发送/)
+  assert.equal(h.calls.length, 0)
+  assert.ok(h.notices.some(message => message.includes('已取消发送')))
+})
+
+async function submitClaude(h, text, signal) {
+  let sent
+  const next = Object.assign(event => {
+    sent = event.text
+    return { text: event.text }
+  }, { signal })
+  const result = await h.hooks.get('prompt.submit')(h.$, { text, origin: { kind: 'composer' } }, next)
+  assert.ok(result && (typeof result.text === 'string' || typeof result.drop === 'string'),
+    'Claude requires a { text } or { drop } submission result; invalid results fall through to sending')
+  return { sent, result }
+}
+
 const flush = async () => { for (let i = 0; i < 4; i++) await new Promise(setImmediate) }
 const context = (runtime, h) => runtime === 'pi' ? h.ctx : h.$
 const noChangeCommentary = 'The prompt is already in natural, grammatically correct English. No changes are needed.'
@@ -209,9 +351,9 @@ const noChangeCommentary = 'The prompt is already in natural, grammatically corr
 async function submit(runtime, h, text) {
   if (runtime === 'pi') {
     const result = await h.hooks.get('input')({ source: 'interactive', text }, h.ctx)
-    return result.action === 'transform' ? result.text : text
+    return result.action === 'handled' ? undefined : result.action === 'transform' ? result.text : text
   }
-  return h.hooks.get('prompt.submit')(h.$, { text, origin: { kind: 'composer' } }, event => event.text)
+  return (await submitClaude(h, text)).sent
 }
 
 for (const runtime of ['pi', 'claude']) {
@@ -228,7 +370,7 @@ for (const runtime of ['pi', 'claude']) {
     }
   })
 
-  test(`${runtime}: missing, changed, duplicated or reordered reference placeholders fall back safely`, async () => {
+  test(`${runtime}: missing, changed, duplicated or reordered reference placeholders cancel sending`, async () => {
     const source = '请检查 @src/登录.ts 和 @src/app.ts'
     for (const corrupt of [
       text => text.replace(/`SERMO_FILE_REF_0`/, ''),
@@ -237,7 +379,7 @@ for (const runtime of ['pi', 'claude']) {
       text => text.replace('SERMO_FILE_REF_0', 'TEMP').replace('SERMO_FILE_REF_1', 'SERMO_FILE_REF_0').replace('TEMP', 'SERMO_FILE_REF_1'),
     ]) {
       const h = load(runtime, { answer: text => corrupt(text.replace('请检查', 'Please review').replace(' 和 ', ' and ')) })
-      assert.equal(await submit(runtime, h, source), source)
+      assert.equal(await submit(runtime, h, source), undefined)
     }
   })
 
@@ -309,10 +451,10 @@ for (const runtime of ['pi', 'claude']) {
             assert.match(payload.messages[0].content, /Do not answer questions, fulfill requests/)
             return n === 1 ? answer : retry
           } })
-          assert.equal(await submit(runtime, h, source), retry === corrected ? corrected : source)
+          assert.equal(await submit(runtime, h, source), retry === corrected ? corrected : undefined)
           assert.equal(h.calls.length, 2)
           assert.match(h.calls[1].system, /Fix only grammar/)
-          if (retry !== corrected) assert.ok(h.notices.some(message => /原文|原样/.test(message)))
+          if (retry !== corrected) assert.ok(h.notices.some(message => /已取消发送/.test(message)))
         }
       }
     })
@@ -320,9 +462,9 @@ for (const runtime of ['pi', 'claude']) {
     test(`${runtime}/${provider}: no-change commentary never replaces a submitted prompt`, async () => {
       for (const text of ['fix all', 'Looks good', 'LGTM']) {
         const h = load(runtime, { config: { provider }, answer: () => noChangeCommentary })
-        assert.equal(await submit(runtime, h, text), text)
-        assert.equal(h.calls.length, 2, 'reject commentary from both attempts, then send the original')
-        assert.ok(h.notices.some(message => /原文|原样/.test(message)))
+        assert.equal(await submit(runtime, h, text), undefined)
+        assert.equal(h.calls.length, 2, 'reject commentary from both attempts, then cancel sending')
+        assert.ok(h.notices.some(message => /已取消发送/.test(message)))
       }
     })
 
@@ -528,10 +670,10 @@ for (const runtime of ['pi', 'claude']) {
 test('Pi: a placeholder split at the request limit cannot escape into the submitted prompt', async () => {
   const source = '请'.repeat(2995) + '@src/登录.ts'
   const h = load('pi', { answer: text => text.replaceAll('请', 'Review ').replace('`SERM', 'BROKEN') })
-  assert.ok(await submit('pi', h, source) === source, 'a damaged split marker must fall back to the original')
+  assert.equal(await submit('pi', h, source), undefined, 'a damaged split marker must cancel sending')
   assert.ok(h.calls.length > 1)
   assert.ok(h.calls.every(call => !call.text.includes('@src/登录.ts')))
-  assert.ok(h.notices.some(message => /保留原文/.test(message)))
+  assert.ok(h.notices.some(message => /已取消发送/.test(message)))
 })
 
 test('Pi: retries preserve masked references and restore them after a valid rewrite', async () => {
@@ -552,7 +694,7 @@ test('Pi: reference placeholders cannot acquire quotes or leak extra markers', a
     text => text + ' SERMO_FILE_REF_99',
   ]) {
     const h = load('pi', { answer: text => corrupt(text.replace('请检查', 'Please review')) })
-    assert.equal(await submit('pi', h, source), source)
+    assert.equal(await submit('pi', h, source), undefined)
   }
 })
 
@@ -660,12 +802,12 @@ test('Pi: technical/target-language skips never announce translation readiness',
   assert.deepEqual(h.notices, [])
 })
 
-test('Pi: failed outbound remains original and explicitly reports fallback', async () => {
+test('Pi: failed outbound cancels sending and reports failure', async () => {
   const h = load('pi', { answer: () => '仍然只是中文润色。' })
   const result = await h.hooks.get('input')({ source: 'interactive', text: '请检查这个修改' }, h.ctx)
-  assert.equal(result.action, 'continue')
+  assert.equal(result.action, 'handled')
   assert.equal(h.calls.length, 2)
-  assert.ok(h.notices.some(message => message.includes('保留原文')))
+  assert.ok(h.notices.some(message => message.includes('已取消发送')))
   assert.match(h.logs.at(-1), /outbound paragraph error/)
 })
 

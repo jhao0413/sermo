@@ -163,13 +163,13 @@ const sameLang = (a: string, b: string) =>
 
 /* ---------------- 微软（Edge 免费接口） ---------------- */
 
-async function msFetch(text: string, to = cfg.lang): Promise<{ out: string; from: string }> {
+async function msFetch(text: string, to = cfg.lang, signal = lifecycle.signal): Promise<{ out: string; from: string }> {
 	const qs = new URLSearchParams({ from: "", to, isEnterpriseClient: "false" })
 	const res = await fetch(`https://edge.microsoft.com/translate/translatetext?${qs}`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify([text]),
-		signal: AbortSignal.any([lifecycle.signal, AbortSignal.timeout(MS_TIMEOUT)]),
+		signal: AbortSignal.any([signal, AbortSignal.timeout(MS_TIMEOUT)]),
 	})
 	if (!res.ok) throw new Error(`microsoft HTTP ${res.status}`)
 	const body = (await res.json()) as unknown
@@ -216,7 +216,7 @@ function resolveModel(ctx: ExtensionContext) {
 	return m ?? ctx.model
 }
 
-async function modelFetch(ctx: ExtensionContext, text: string, system?: string): Promise<{ out: string; from: string }> {
+async function modelFetch(ctx: ExtensionContext, text: string, system?: string, signal = lifecycle.signal): Promise<{ out: string; from: string }> {
 	const model = resolveModel(ctx)
 	if (!model) throw new Error("session: no model available")
 	const r = await ctx.modelRegistry.complete(
@@ -225,7 +225,7 @@ async function modelFetch(ctx: ExtensionContext, text: string, system?: string):
 			systemPrompt: system ?? MODEL_SYSTEM(),
 			messages: [{ role: "user", content: [{ type: "text", text }], timestamp: Date.now() }],
 		},
-		{ maxTokens: MAX_TOKENS, timeoutMs: MODEL_TIMEOUT, signal: lifecycle.signal, temperature: 0.2, reasoning: "off" },
+		{ maxTokens: MAX_TOKENS, timeoutMs: MODEL_TIMEOUT, signal, temperature: 0.2, reasoning: "off" },
 	)
 	if (r.stopReason === "aborted") throw new Error("model aborted")
 	if (r.stopReason === "error") throw new Error(r.errorMessage ?? "model error")
@@ -253,7 +253,7 @@ function stripThink(s: string) {
 	return s.replace(/<think>[\s\S]*?<\/think>/g, "").trim()
 }
 
-async function openaiFetch(text: string, system?: string): Promise<{ out: string; from: string }> {
+async function openaiFetch(text: string, system?: string, signal = lifecycle.signal): Promise<{ out: string; from: string }> {
 	const base = cfg.baseUrl.replace(/\/+$/, "")
 	const res = await fetch(`${base}/chat/completions`, {
 		method: "POST",
@@ -270,7 +270,7 @@ async function openaiFetch(text: string, system?: string): Promise<{ out: string
 				{ role: "user", content: text },
 			],
 		}),
-		signal: AbortSignal.any([lifecycle.signal, AbortSignal.timeout(OPENAI_TIMEOUT)]),
+		signal: AbortSignal.any([signal, AbortSignal.timeout(OPENAI_TIMEOUT)]),
 	})
 	if (!res.ok) throw new Error(`openai HTTP ${res.status}`)
 	const body = (await res.json()) as {
@@ -453,11 +453,11 @@ function quoteTranslation(text: string, translation: string) {
 		translation.split("\n").map((line) => `> ${line}`).join("\n") + trailing
 }
 
-/** 固定并发跑一批任务（worker 内部自行 try/catch，单条失败不外溢） */
-async function runPool<T>(items: T[], size: number, worker: (item: T) => Promise<void>) {
+/** Fixed concurrency; outbound callers stop the pool when their submission is aborted. */
+async function runPool<T>(items: T[], size: number, worker: (item: T) => Promise<void>, signal?: AbortSignal) {
 	let cursor = 0
 	const run = async () => {
-		while (cursor < items.length) await worker(items[cursor++])
+		while (cursor < items.length && !signal?.aborted) await worker(items[cursor++])
 	}
 	await Promise.all(Array.from({ length: Math.min(size, items.length) }, run))
 }
@@ -480,12 +480,29 @@ function chunkParagraph(s: string, max = MAX_CHARS) {
 	return chunks.length ? chunks : [s]
 }
 
-const fetchOne = (ctx: ExtensionContext, text: string, opts: { system?: string; to?: string } = {}) =>
+const fetchOne = (ctx: ExtensionContext, text: string, opts: { system?: string; to?: string; signal?: AbortSignal } = {}) =>
 	cfg.provider === "session"
-		? modelFetch(ctx, text, opts.system)
+		? modelFetch(ctx, text, opts.system, opts.signal)
 		: cfg.provider === "openai"
-			? openaiFetch(text, opts.system)
-			: msFetch(text, opts.to)
+			? openaiFetch(text, opts.system, opts.signal)
+			: msFetch(text, opts.to, opts.signal)
+
+async function outboundFetch(ctx: ExtensionContext, text: string, opts: { system?: string; to?: string; signal?: AbortSignal } = {}) {
+	const epoch = generation
+	const signal = opts.signal ?? lifecycle.signal
+	for (let attempt = 0; ; attempt++) {
+		if (epoch !== generation) throw new Error("outbound cancelled")
+		signal.throwIfAborted()
+		try {
+			const result = await fetchOne(ctx, text, { ...opts, signal })
+			signal.throwIfAborted()
+			return result
+		} catch (err) {
+			if (epoch !== generation || signal.aborted || attempt >= 3) throw err
+			diag(`outbound request retry ${attempt + 1}/3: ${errorText(err)}`)
+		}
+	}
+}
 
 /** One prose paragraph, with a hard request limit even when it contains a single long line. */
 async function translateProse(ctx: ExtensionContext, text: string) {
@@ -617,17 +634,18 @@ function protectFileReferences(text: string) {
 }
 
 /** Rewrite outbound prose while restoring file mentions exactly. */
-async function ensureEnglishProse(ctx: ExtensionContext, text: string) {
+async function ensureEnglishProse(ctx: ExtensionContext, text: string, signal = lifecycle.signal) {
 	const protectedText = protectFileReferences(text)
-	const result = await rewriteEnglishProse(ctx, protectedText.masked)
+	const result = await rewriteEnglishProse(ctx, protectedText.masked, signal)
 	return result === null ? null : protectedText.restore(result)
 }
 
-async function rewriteEnglishProse(ctx: ExtensionContext, text: string) {
+async function rewriteEnglishProse(ctx: ExtensionContext, text: string, signal = lifecycle.signal) {
 	if (looksTechnical(text)) return null // 粘贴的错误信息/JSON/日志等原样放行
 	const epoch = generation
 	const checkBranch = () => {
 		if (epoch !== generation) throw new Error("outbound cancelled after branch change")
+		signal.throwIfAborted()
 	}
 	if (cfg.provider === "microsoft") {
 		// Detect language for every chunk, including foreign text after an English prefix.
@@ -636,7 +654,7 @@ async function rewriteEnglishProse(ctx: ExtensionContext, text: string) {
 		let any = false
 		for (let i = 0; i < chunks.length; i++) {
 			checkBranch()
-			const r = await msFetch(chunks[i], "en")
+			const r = await outboundFetch(ctx, chunks[i], { to: "en", signal })
 			const en = /^en(-|$)/i.test(r.from) && !nonLatinCount(chunks[i]) ? chunks[i].trim() : r.out.trim()
 			if (!okRewrite(chunks[i], en)) throw new Error("microsoft did not return an English translation")
 			if (en !== chunks[i].trim()) {
@@ -653,13 +671,13 @@ async function rewriteEnglishProse(ctx: ExtensionContext, text: string) {
 	let any = false
 	for (const chunk of chunkParagraph(text)) {
 		checkBranch()
-		let en = (await fetchOne(ctx, chunk, { system })).out.trim()
+		let en = (await outboundFetch(ctx, chunk, { system, signal })).out.trim()
 		checkBranch()
 		if (!okRewrite(chunk, en)) {
 			diag(`outbound suspect len=${chunk.length}`)
 			const grammar = !nonLatinCount(chunk) && isLikelyEnglish(chunk)
 			const wrap = grammar ? OUT_GRAMMAR_WRAP(chunk) : OUT_RETRY_WRAP(chunk)
-			en = (await fetchOne(ctx, wrap, { system: grammar ? OUT_GRAMMAR_SYSTEM : OUT_RETRY_SYSTEM })).out.trim()
+			en = (await outboundFetch(ctx, wrap, { system: grammar ? OUT_GRAMMAR_SYSTEM : OUT_RETRY_SYSTEM, signal })).out.trim()
 			if (!okRewrite(chunk, en)) throw new Error("outbound retry did not return an English rewrite")
 			diag(`outbound retry ok len=${en.length}`)
 		}
@@ -671,23 +689,29 @@ async function rewriteEnglishProse(ctx: ExtensionContext, text: string) {
 	return any ? out.join("") : null
 }
 
-/** Keep raw formatting and report failed paragraphs while passing their originals through. */
+/** Stop the whole submission at its first terminal paragraph failure. */
 async function outboundBlock(ctx: ExtensionContext, text: string) {
 	const paras = splitParas(text)
-	let errors = 0
-	const epoch = generation
-	await runPool(paras, 4, async (p) => {
-		if (p.code !== undefined || p.text === undefined || epoch !== generation) return
-		try {
-			const en = await ensureEnglishProse(ctx, p.text)
-			if (en) p.en = preserveWhitespace(p.text, en)
-		} catch (err) {
-			errors++
-			diag(`outbound paragraph error len=${p.text.length}: ${errorText(err)}`)
-		}
-	})
+	const controller = new AbortController()
+	const signal = AbortSignal.any([lifecycle.signal, controller.signal])
+	try {
+		await runPool(paras, 4, async (p) => {
+			if (p.code !== undefined || p.text === undefined) return
+			try {
+				const en = await ensureEnglishProse(ctx, p.text, signal)
+				signal.throwIfAborted()
+				if (en) p.en = preserveWhitespace(p.text, en)
+			} catch (err) {
+				if (!signal.aborted) diag(`outbound paragraph error len=${p.text.length}: ${errorText(err)}`)
+				controller.abort(err)
+				throw err
+			}
+		}, signal)
+	} catch {
+		return { text, changed: false, errors: 1 }
+	}
 	const changed = paras.some((p) => p.en !== undefined)
-	return { text: changed ? paras.map((p) => p.code ?? p.en ?? p.text ?? "").join("") : text, changed, errors }
+	return { text: changed ? paras.map((p) => p.code ?? p.en ?? p.text ?? "").join("") : text, changed, errors: 0 }
 }
 
 function errorText(err: unknown) {
@@ -942,7 +966,7 @@ function toggleTranslation(ctx: ExtensionContext, next = !enabled) {
 	})
 
 	// 出站：只拦本机编辑器敲 Enter 的提交（source === "interactive"）；斜杠命令、
-	// 扩展注入（sendUserMessage）的提交不碰。任何失败都原样放行，绝不拦提示词。
+	// 扩展注入（sendUserMessage）的提交不碰。转换失败时取消发送。
 	pi.on("input", async (event, ctx) => {
 		const text = event.text ?? ""
 		if (!enabled || event.source !== "interactive" || !cfg.outbound || !text.trim() || text.startsWith("/")) {
@@ -955,7 +979,10 @@ function toggleTranslation(ctx: ExtensionContext, next = !enabled) {
 			const { text: en, changed, errors } = await outboundBlock(ctx, text)
 			if (inputBranchGeneration !== branchGeneration) return { action: "handled" }
 			if (inputEnableGeneration !== enableGeneration) return { action: "continue" }
-			if (errors) toast(ctx, `${changed ? "提示词部分内容未能翻译" : "提示词翻译失败"}，已保留原文；详见 ${LOG_PATH}`)
+			if (errors) {
+				toast(ctx, `提示词翻译失败，已取消发送；详见 ${LOG_PATH}`)
+				return { action: "handled" }
+			}
 			if (!changed || !en.trim()) {
 				seenUserTexts.add(text)
 				if (outboundMap.has(text) && outboundMap.get(text) !== text) putCapped(outboundMap, text, null)
@@ -972,7 +999,8 @@ function toggleTranslation(ctx: ExtensionContext, next = !enabled) {
 			if (inputBranchGeneration !== branchGeneration) return { action: "handled" }
 			if (inputEnableGeneration !== enableGeneration) return { action: "continue" }
 			diag(`outbound error: ${String((err && (err as Error).message) || err).slice(0, 150)}`)
-			return { action: "continue" }
+			toast(ctx, `提示词翻译失败，已取消发送；详见 ${LOG_PATH}`)
+			return { action: "handled" }
 		}
 	})
 

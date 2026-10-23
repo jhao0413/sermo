@@ -27,14 +27,28 @@ let enabled = true
 let generation = 0
 let lifecycle = new AbortController()
 // Carry cancellation state separately: Claude's hook compiler forbids wrapping or assigning $.
-function translationScope() {
-  return { epoch: generation, signal: lifecycle.signal }
+function translationScope(submissionSignal, parent = { epoch: generation, signal: lifecycle.signal }) {
+  const epoch = parent.epoch
+  const translationSignal = parent.signal
+  if (!submissionSignal) return { epoch, signal: translationSignal }
+  const controller = new AbortController()
+  const cancelTranslation = () => controller.abort(translationSignal.reason)
+  const cancelSubmission = () => controller.abort(submissionSignal.reason)
+  translationSignal.addEventListener('abort', cancelTranslation, { once: true })
+  submissionSignal.addEventListener('abort', cancelSubmission, { once: true })
+  if (translationSignal.aborted) cancelTranslation()
+  if (submissionSignal.aborted) cancelSubmission()
+  return { epoch, signal: controller.signal, dispose() {
+    translationSignal.removeEventListener('abort', cancelTranslation)
+    submissionSignal.removeEventListener('abort', cancelSubmission)
+  } }
 }
 
 function assertTranslationActive(scope) {
   if (!enabled || scope.epoch !== generation) {
     throw new Error('translation disabled or superseded')
   }
+  scope.signal.throwIfAborted()
 }
 
 /** 原文 -> { state: 'pending'|'done'|'skip'|'error', md?, paras? }，保留逐段结果供失败重试。 */
@@ -327,11 +341,11 @@ function splitParas(text) {
   return paras
 }
 
-/** 固定并发跑一批任务（worker 内部自行 try/catch，单条失败不外溢） */
-async function runPool(items, size, worker) {
+/** Fixed concurrency; outbound callers stop the pool when their submission is aborted. */
+async function runPool(items, size, worker, signal) {
   let cursor = 0
   const run = async () => {
-    while (cursor < items.length) await worker(items[cursor++])
+    while (cursor < items.length && !signal?.aborted) await worker(items[cursor++])
   }
   await Promise.all(Array.from({ length: Math.min(size, items.length) }, run))
 }
@@ -370,6 +384,19 @@ const fetchOne = ($, text, opts = {}, scope = translationScope()) =>
     : cfg.provider === 'openai'
       ? openaiFetch($, text, opts.system, scope)
       : msFetch($, text, opts.to, scope)
+
+async function outboundFetch($, text, opts = {}, scope = translationScope()) {
+  for (let attempt = 0; ; attempt++) {
+    assertTranslationActive(scope)
+    try {
+      return await fetchOne($, text, opts, scope)
+    } catch (err) {
+      assertTranslationActive(scope)
+      if (attempt >= 3) throw err
+      diag($, `outbound request retry ${attempt + 1}/3: ${String(err?.message ?? err).slice(0, 150)}`)
+    }
+  }
+}
 
 /** 一段散文按长度切块翻译；源语言已是目标语言的块原样保留 */
 async function translateProse($, text, scope = translationScope()) {
@@ -571,7 +598,7 @@ async function rewriteEnglishProse($, text, scope = translationScope()) {
     const out = []
     let any = false
     for (const chunk of chunkParagraph(text)) {
-      const r = await msFetch($, chunk, 'en', scope)
+      const r = await outboundFetch($, chunk, { to: 'en' }, scope)
       if (/^en(-|$)/i.test(r.from) && !nonLatinLetterCount(chunk)) {
         out.push(chunk)
         continue
@@ -589,19 +616,19 @@ async function rewriteEnglishProse($, text, scope = translationScope()) {
   let any = false
   for (const chunk of chunkParagraph(text)) {
     const likelyEnglish = isLikelyEnglish(chunk)
-    let en = (await fetchOne($, chunk, { system }, scope)).out.trim()
+    let en = (await outboundFetch($, chunk, { system }, scope)).out.trim()
     // 不认的改写：输出还是源语言（只润色没翻译）、非拉丁原样返回、英文输入收到元评论。
-    // 用明确系统提示重试一次，仍不过就放行该段原文——绝不让废话冒充英文发出。
+    // 用明确系统提示重试一次，仍不过就取消发送。
     const invalid = (candidate) => !okRewrite(chunk, candidate)
     if (invalid(en)) {
       diag($, `outbound suspect in="${chunk.slice(0, 40)}" out="${en.slice(0, 40)}"`)
       const retrySystem = likelyEnglish && nonLatinLetterCount(chunk) === 0 ? OUT_GRAMMAR_RETRY_SYSTEM() : OUT_TRANSLATE_RETRY_SYSTEM()
-      const retry = (await fetchOne($, chunk, { system: retrySystem }, scope)).out.trim()
+      const retry = (await outboundFetch($, chunk, { system: retrySystem }, scope)).out.trim()
       if (retry && !invalid(retry)) {
         en = retry
         diag($, `outbound retry ok out="${retry.slice(0, 40)}"`)
       } else {
-        diag($, `outbound retry failed; fallback original len=${chunk.length}`)
+        diag($, `outbound retry failed len=${chunk.length}`)
         throw new Error('outbound retry did not return an English rewrite')
       }
     }
@@ -610,31 +637,40 @@ async function rewriteEnglishProse($, text, scope = translationScope()) {
   return any ? out.join('') : null
 }
 
-/** 出站整块：代码/分隔符不动，散文段并发处理；返回 { text, changed, errors }（没改动时 text 即原文） */
-async function outboundBlock($, text) {
-  const scope = translationScope()
+/** Stop the whole submission at its first terminal paragraph failure. */
+async function outboundBlock($, text, scope = translationScope()) {
   const paras = splitParas(text)
-  await runPool(paras, 4, async (p) => {
-    if (p.text === undefined) return
-    try {
-      const en = await ensureEnglishProse($, p.text, scope)
-      if (en) p.en = preserveWhitespace(p.text, en)
-    } catch (err) {
-      p.error = err
-      diag($, `outbound paragraph error len=${p.text.length}: ${String((err && err.message) || err).slice(0, 150)}`)
-    }
-  })
+  const controller = new AbortController()
+  const requestScope = translationScope(controller.signal, scope)
+  try {
+    await runPool(paras, 4, async (p) => {
+      if (p.text === undefined) return
+      try {
+        const en = await ensureEnglishProse($, p.text, requestScope)
+        assertTranslationActive(requestScope)
+        if (en) p.en = preserveWhitespace(p.text, en)
+      } catch (err) {
+        if (!requestScope.signal.aborted) {
+          diag($, `outbound paragraph error len=${p.text.length}: ${String((err && err.message) || err).slice(0, 150)}`)
+        }
+        controller.abort(err)
+        throw err
+      }
+    }, requestScope.signal)
+  } catch {
+    return { text, changed: false, errors: 1 }
+  } finally {
+    requestScope.dispose()
+  }
 
   let any = false
-  let errors = 0
   const out = paras.map((p) => {
     if (p.code !== undefined) return p.code
     if (p.separator !== undefined) return p.separator
-    if (p.error) errors++
     if (p.en) any = true
     return p.en ?? p.text
   }).join('')
-  return { text: any ? out : text, changed: any, errors }
+  return { text: any ? out : text, changed: any, errors: 0 }
 }
 
 /** 诊断：写 /tmp/pt-live.log（只记关键转移，保留最近 60 条） */
@@ -793,24 +829,31 @@ export function register(on, options) {
   on('prompt.submit', { origin: { kind: 'composer' } }, async ($, e, next) => {
     const text = e.text ?? ''
     if (!enabled || !cfg.outbound || !text.trim() || text.startsWith('/')) return next(e)
-    const epoch = generation
+    const scope = translationScope(next.signal)
+    const failureMessage = '提示词英文转换失败，已取消发送（见 /tmp/pt-live.log）'
     try {
+      if (next.signal?.aborted) return { drop: '提示词发送已取消' }
       if (cfg.provider !== 'microsoft' && text.length > 120) $.ui.toast('正在把提示词转成英文…')
-      const { text: en, changed, errors } = await outboundBlock($, text)
-      if (!enabled || epoch !== generation) return next(e)
-      if (!changed || !en.trim()) {
-        if (errors) $.ui.toast('提示词英文转换失败，已原样发送（见 /tmp/pt-live.log）')
-        return next(e)
+      const { text: en, changed, errors } = await outboundBlock($, text, scope)
+      if (next.signal?.aborted) return { drop: '提示词发送已取消' }
+      if (!enabled || scope.epoch !== generation) return next(e)
+      if (errors) {
+        $.ui.toast(failureMessage)
+        return { drop: failureMessage }
       }
-      if (errors) $.ui.toast(`提示词已部分转成英文（${errors} 段保留原文，见 /tmp/pt-live.log）`)
+      if (!changed || !en.trim()) return next(e)
       putOutboundMap(en, text) // 先入映射再 next，跟上的重渲染直接能画对照；冲突时标 ambiguous
       diag($, `outbound len=${text.length} -> ${en.length} errors=${errors}`)
       // 模型与落盘都是英文；屏幕上的用户行跟着变英文，由下面的渲染钩子画成双语对照
       return next({ ...e, text: en })
     } catch (err) {
-      if (!enabled || epoch !== generation) return next(e)
+      if (next.signal?.aborted) return { drop: '提示词发送已取消' }
+      if (!enabled || scope.epoch !== generation) return next(e)
       diag($, `outbound error: ${String((err && err.message) || err).slice(0, 150)}`)
-      return next(e) // 任何失败都原样放行，绝不拦提示词
+      $.ui.toast(failureMessage)
+      return { drop: failureMessage }
+    } finally {
+      scope.dispose?.()
     }
   })
 
