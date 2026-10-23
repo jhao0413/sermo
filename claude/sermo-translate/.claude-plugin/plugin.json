@@ -10,6 +10,12 @@
       "description": "开启（默认）时显示回复译文；关闭时隐藏回复译文。Ctrl+Y 或 /translate 切换回复译文显示；/translate on 和 /translate off 启用或停用两侧翻译",
       "default": true
     },
+    "translation_only": {
+      "type": "boolean",
+      "title": "仅显示译文",
+      "description": "开启后，已翻译的回复段落只显示译文；代码、跳过、翻译中或失败的段落保留原文。默认关闭，显示双语对照。/translate only 和 /translate bilingual 可在会话中切换",
+      "default": false
+    },
     "outbound": {
       "type": "boolean",
       "title": "发出内容保证英文",

@@ -2,7 +2,7 @@
 
 写给想用英文跟模型对话的非英语用户。
 
-Claude 的英文回复在后台翻成你配置的语言，`Ctrl+Y` 切换回复译文显示，译文跟在对应的原文段落后面。你输入的提示词在发出前会被改写成英文：是外文就翻译，已经是英文就只修语法，意思不变。发出后保留原文和英文的对照。
+Claude 的英文回复在后台翻成你配置的语言，`Ctrl+Y` 切换回复译文显示，默认译文跟在对应的原文段落后面，也可只显示译文。你输入的提示词在发出前会被改写成英文：是外文就翻译，已经是英文就只修语法，意思不变。发出后保留原文和英文的对照。
 
 译文和对照都只在显示层，整个对话上下文里始终只有英文。
 
@@ -16,6 +16,7 @@ Claude 的英文回复在后台翻成你配置的语言，`Ctrl+Y` 切换回复�
     "sermo-translate@sermo": {
       "options": {
         "show_by_default": true,
+        "translation_only": false,
         "outbound": true,
         "lang": "zh-Hans",
         "provider": "microsoft",
@@ -31,6 +32,7 @@ Claude 的英文回复在后台翻成你配置的语言，`Ctrl+Y` 切换回复�
 | 选项 | 默认 | 说明 |
 |---|---|---|
 | `show_by_default` | `true` | 是否显示回复译文；不控制翻译服务的启停 |
+| `translation_only` | `false` | 开启后已翻译的回复段落只显示译文；默认逐段显示双语对照。代码、跳过、翻译中或失败的段落保留原文，不影响用户提示词对照 |
 | `outbound` | `true` | 出站链路总开关 |
 | `lang` | `zh-Hans` | 你的语言，微软语言码：`zh-Hant`、`ja`、`ko`、`fr`、`de`、`es`、`ru` 等 |
 | `provider` | `microsoft` | 翻译服务，见下 |
@@ -80,6 +82,7 @@ provider 三选一：
 - 按空行分段，列表、标题整段翻；代码块不送翻也不插译文；长段按空行切块，单块 ≤3000 字符
 - 已是目标语言的块跳过：微软靠接口的 `detectedLanguage` 和 `lang` 比对；`session` / `openai` 对 `zh` 系目标先本地数 CJK 字符，省一次调用；其他语言靠提示词约定「已是目标语言则原样返回」再逐块比对
 - 诊断日志在 `/tmp/pt-live.log`，保留最近 60 条，排查看它
+- `/translate only` 和 `/translate bilingual`：显示回复译文，并切换为「仅译文」或「双语对照」，复用已缓存的译文；只在当前会话生效。要默认仅显示译文，在 `/config` 开启「仅显示译文」或设置 `"translation_only": true`。隐藏译文或停用翻译时显示原文，重新显示或启用会保留选定的模式；这些命令不启用已停用的翻译服务。
 - `/translate` 命令等价 `Ctrl+Y`，只切换回复译文显示，不影响后台翻译或提示词改写；`/translate on` 和 `/translate off` 则启用或停用两侧翻译。提示行持续显示服务状态 `Translation: on/off`。键位在 `~/.claude/keybindings.json`
 
 ## 不影响上下文

@@ -3,7 +3,7 @@
  *
  * 行为对齐 claude/sermo-translate：
  *  - 回复：完成的文本/思考块即后台翻译并缓存，Ctrl+Y / /translate 切换显示，
- *    逐段穿插：每段原文下面直接跟它自己的 `> ` 译文。译文只改渲染层（registerMarkdownTransformer），
+ *    默认逐段穿插原文和 `> ` 译文，可配置为仅显示译文。译文只改渲染层（registerMarkdownTransformer），
  *    会话存储与模型上下文不受显示译文影响。
  *  - 出站：input 事件（对应 Claude 版的 prompt.submit）把本机敲 Enter 的提示词改写成英文再进会话
  *    （外文忠实翻译；英文只修语法，不改意思）；屏幕上的用户行渲染成「原文在上、英文引用在下」的双语对照。
@@ -37,6 +37,7 @@ export default function sermoTranslate(pi: ExtensionAPI) {
 /** 配置（加载时从 CONFIG_PATH 读；改完 /reload 生效） */
 const cfg = {
 	showByDefault: true,
+	translationOnly: false,
 	outbound: true,
 	lang: "zh-Hans",
 	provider: "microsoft",
@@ -108,6 +109,7 @@ function loadConfig() {
 		const raw = JSON.parse(text)
 		if (typeof raw !== "object" || raw === null) return
 		cfg.showByDefault = typeof raw.show_by_default === "boolean" ? raw.show_by_default : true
+		cfg.translationOnly = raw.translation_only === true
 		cfg.outbound = typeof raw.outbound === "boolean" ? raw.outbound : true
 		if (typeof raw.lang === "string" && raw.lang.trim()) cfg.lang = raw.lang.trim()
 		const providerRaw = typeof raw.provider === "string" ? raw.provider.trim() : ""
@@ -842,15 +844,15 @@ function updateTranslationStatus(ctx: ExtensionContext) {
 	}
 }
 
-function toggleShow(ctx: ExtensionContext) {
-	show = !show
+function toggleShow(ctx: ExtensionContext, next = !show) {
+	show = next
 	if (enabled && show) {
 		for (const [text, entry] of cache) {
 			if (entry.state === "error") void scheduleOne(ctx, text, true)
 		}
 	}
 	diag(`toggle show=${show}`)
-	toast(ctx, `译文：${show ? "显示" : "隐藏"}`)
+	toast(ctx, `译文：${show ? cfg.translationOnly ? "仅显示译文" : "双语对照" : "隐藏"}`)
 	refreshTranscript(ctx)
 }
 
@@ -901,11 +903,16 @@ function toggleTranslation(ctx: ExtensionContext, next = !enabled) {
 	}
 
 	pi.registerCommand("translate", {
-		description: "Toggle reply translation display; on/off enables/disables translation",
+		description: "Toggle reply translations; only/bilingual selects display, on/off controls translation",
 		handler: async (args, ctx) => {
 			const state = args.trim().toLowerCase()
+			if (state === "only" || state === "bilingual") {
+				cfg.translationOnly = state === "only"
+				toggleShow(ctx, true)
+				return
+			}
 			if (state && state !== "on" && state !== "off") {
-				toast(ctx, "Usage: /translate [on|off]")
+				toast(ctx, "Usage: /translate [on|off|only|bilingual]")
 				return
 			}
 			if (state) toggleTranslation(ctx, state === "on")
@@ -914,7 +921,7 @@ function toggleTranslation(ctx: ExtensionContext, next = !enabled) {
 	})
 
 	// 渲染层（唯一改显示的地方；会话存储与模型上下文不受影响）：
-	//  - assistant：缓存命中且显示开着时，替换成逐段穿插译文后的 markdown
+	//  - assistant：缓存命中且显示开着时，按配置仅显示译文或逐段穿插双语对照
 	//  - user：发出的英文命中 outboundMap 时，画成「原文在上、英文引用在下」的对照
 	pi.registerMarkdownTransformer((md, mctx) => {
 		try {
@@ -924,8 +931,8 @@ function toggleTranslation(ctx: ExtensionContext, next = !enabled) {
 				return splitParas(md).map((part) => {
 					if (part.text === undefined) return part.code ?? ""
 					const entry = cache.get(part.text.trim())
-					return entry?.state === "done" && entry.translation
-						? quoteTranslation(part.text, entry.translation) : part.text
+					if (entry?.state !== "done" || !entry.translation) return part.text
+					return cfg.translationOnly ? preserveWhitespace(part.text, entry.translation) : quoteTranslation(part.text, entry.translation)
 				}).join("")
 			}
 			if (mctx.messageType === "user") {
@@ -1018,7 +1025,7 @@ function toggleTranslation(ctx: ExtensionContext, next = !enabled) {
 		updateTranslationStatus(ctx)
 		diag(
 			`loaded provider=${cfg.provider} model=${cfg.model} baseUrl=${cfg.baseUrl} ` +
-				`showByDefault=${cfg.showByDefault} outbound=${cfg.outbound} lang=${cfg.lang} toggle=${cfg.toggleKey}`,
+				`showByDefault=${cfg.showByDefault} translationOnly=${cfg.translationOnly} outbound=${cfg.outbound} lang=${cfg.lang} toggle=${cfg.toggleKey}`,
 		)
 	})
 }

@@ -2,7 +2,7 @@
  * sermo-translate — Claude 的英文回复自动翻成配置的目标语言；发出的提示词保证是地道英文。
  *
  * 行为：回复稳定约 1.5s 后后台翻好缓存；快捷键（Ctrl+Y）切换显示。
- * 逐段穿插：每段原文下面直接跟它自己的 `> ` 译文。
+ * 默认逐段穿插原文和 `> ` 译文，可配置为仅显示译文。
  * 出站：prompt.submit 时把提示词改写成英文（其他语言忠实翻译；英文只修语法，
  * 不改意思），模型与 transcript 收到的都是英文；用户消息行渲染成双语对照。
  * 粘贴的技术性内容（错误信息/堆栈/JSON/日志/diff）两侧都不送翻，原样放行。
@@ -19,7 +19,7 @@ const MAX_TOKENS = 16_000 // 单次补全输出上限：3000 字符块的重写�
 const MAP_CAP = 500 // cache / outboundMap 条目上限（FIFO 淘汰最旧，防长会话无限增长）
 
 /** userConfig 传入的配置（register 时初始化） */
-const cfg = { showByDefault: false, outbound: true, lang: 'zh-Hans', provider: 'microsoft', model: 'haiku', baseUrl: 'http://127.0.0.1:8021/v1', apiKey: '' }
+const cfg = { showByDefault: false, translationOnly: false, outbound: true, lang: 'zh-Hans', provider: 'microsoft', model: 'haiku', baseUrl: 'http://127.0.0.1:8021/v1', apiKey: '' }
 
 /** 回复译文显示偏好；enabled 控制两侧翻译的启停。 */
 let show = false
@@ -378,6 +378,14 @@ function quoteTranslation(text, translation) {
     translation.split("\n").map((line) => `> ${line}`).join("\n") + trailing
 }
 
+function translationOnlyBlock(paras) {
+  return paras.map(p => {
+    if (p.code !== undefined) return p.code
+    if (p.separator !== undefined) return p.separator
+    return p.translation ? preserveWhitespace(p.text, p.translation) : p.text
+  }).join('')
+}
+
 const fetchOne = ($, text, opts = {}, scope = translationScope()) =>
   cfg.provider === 'session'
     ? modelFetch($, text, opts.system, scope)
@@ -721,8 +729,8 @@ function onRenderText($, text) {
   })
 }
 
-function toggleShow($) {
-  show = !show
+function toggleShow($, next = !show) {
+  show = next
   if (enabled && show) {
     for (const [text, entry] of cache) {
       if (entry.state === 'error' || entry.errors) {
@@ -731,7 +739,7 @@ function toggleShow($) {
     }
   }
   diag($, `toggle show=${show}`)
-  $.ui.toast(`译文：${show ? '显示' : '隐藏'}`)
+  $.ui.toast(`译文：${show ? cfg.translationOnly ? '仅显示译文' : '双语对照' : '隐藏'}`)
   $.ui.invalidate('ui.render')
 }
 
@@ -776,6 +784,7 @@ export function register(on, options) {
 
   // userConfig（/config 面板或 settings.json 的 pluginConfigs["sermo-translate@inline"]）
   cfg.showByDefault = options?.show_by_default !== false // 默认 true（0.4.3 起）
+  cfg.translationOnly = options?.translation_only === true
   cfg.outbound = options?.outbound !== false
   cfg.lang = typeof options?.lang === 'string' && options.lang.trim() ? options.lang.trim() : 'zh-Hans'
   // 旧值 model（≤0.4.1）兼容：映射为 session
@@ -788,16 +797,21 @@ export function register(on, options) {
 
   on('session.start', async ($, e, next) => {
     outboundMap.clear()
-    await $.command.register({ name: 'translate', description: 'Toggle reply translation display; on/off enables/disables translation', immediate: true })
+    await $.command.register({ name: 'translate', description: 'Toggle reply translations; only/bilingual selects display, on/off controls translation', immediate: true })
     $.ui.status(`Translation: ${enabled ? 'on' : 'off'}`)
-    diag($, `loaded provider=${cfg.provider} model=${cfg.model} baseUrl=${cfg.baseUrl} showByDefault=${cfg.showByDefault} outbound=${cfg.outbound} lang=${cfg.lang}`)
+    diag($, `loaded provider=${cfg.provider} model=${cfg.model} baseUrl=${cfg.baseUrl} showByDefault=${cfg.showByDefault} translationOnly=${cfg.translationOnly} outbound=${cfg.outbound} lang=${cfg.lang}`)
     return next(e)
   })
 
   on('command.run', { command: 'translate' }, async ($, e) => {
     const state = (e.args ?? '').trim().toLowerCase()
+    if (state === 'only' || state === 'bilingual') {
+      cfg.translationOnly = state === 'only'
+      toggleShow($, true)
+      return {}
+    }
     if (state && state !== 'on' && state !== 'off') {
-      $.ui.toast('Usage: /translate [on|off]')
+      $.ui.toast('Usage: /translate [on|off|only|bilingual]')
       return {}
     }
     if (state) setTranslationEnabled($, state === 'on')
@@ -821,8 +835,9 @@ export function register(on, options) {
     diag($, `render len=${text.length} state=${entry ? entry.state : 'none'}`)
     if (!entry?.md) return next(e)
 
-    // 缓存里已是拼好的逐段穿插版本，直接替换显示文本（只影响渲染，不落盘不进上下文）
-    return next({ ...e, props: { ...e.props, text: entry.md } })
+    // 缓存保留逐段结果，切换显示模式时复用译文，不重新请求（只影响渲染）。
+    const md = cfg.translationOnly ? translationOnlyBlock(entry.paras) : entry.md
+    return next({ ...e, props: { ...e.props, text: md } })
   })
 
   // 出站：本机敲 Enter 的提示词改写成英文再进会话（插件/peer/通知的提交不动）
