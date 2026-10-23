@@ -1,0 +1,9 @@
+# Changelog
+
+## 0.1.2
+
+- Fix the Claude Code translation plugin failing to load because cancellation code wrapped and reassigned the special `$` hook API object.
+- Pass cancellation state separately through translation chunks and retries, preserving cancellation when translation is disabled and re-enabled.
+- Add regression coverage for outgoing translation and cancellation across Microsoft, session, and OpenAI-compatible providers, and include it in the test command.
+
+Validation: 101 tests pass; TypeScript checks pass; the plugin loads successfully in Claude Code 2.1.309.

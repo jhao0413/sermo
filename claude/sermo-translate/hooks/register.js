@@ -26,17 +26,13 @@ let show = false
 let enabled = true
 let generation = 0
 let lifecycle = new AbortController()
-const TRANSLATION_SIGNAL = Symbol('translationSignal')
-const TRANSLATION_EPOCH = Symbol('translationEpoch')
-
-// Carry the starting generation through every chunk and retry of a translation.
-function translationScope($) {
-  if ($[TRANSLATION_EPOCH] !== undefined) return $
-  return Object.assign(Object.create($), { [TRANSLATION_EPOCH]: generation, [TRANSLATION_SIGNAL]: lifecycle.signal })
+// Carry cancellation state separately: Claude's hook compiler forbids wrapping or assigning $.
+function translationScope() {
+  return { epoch: generation, signal: lifecycle.signal }
 }
 
-function assertTranslationActive($) {
-  if (!enabled || ($[TRANSLATION_EPOCH] !== undefined && $[TRANSLATION_EPOCH] !== generation)) {
+function assertTranslationActive(scope) {
+  if (!enabled || scope.epoch !== generation) {
     throw new Error('translation disabled or superseded')
   }
 }
@@ -93,15 +89,15 @@ function parseBody(res) {
   return typeof res.text === 'string' ? JSON.parse(res.text) : res.text
 }
 
-async function msFetch($, text, to = cfg.lang) {
-  assertTranslationActive($)
+async function msFetch($, text, to = cfg.lang, scope = translationScope()) {
+  assertTranslationActive(scope)
   const qs = new URLSearchParams({ from: '', to, isEnterpriseClient: 'false' })
   const res = await $.http.fetch(`https://edge.microsoft.com/translate/translatetext?${qs}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify([text]),
   })
-  assertTranslationActive($)
+  assertTranslationActive(scope)
   if (!res.ok) throw new Error(`microsoft HTTP ${res.status}`)
   const body = parseBody(res)
   if (!Array.isArray(body) || body.length !== 1) throw new Error('microsoft bad response')
@@ -125,16 +121,16 @@ const MODEL_SYSTEM = () =>
   `If the message is already entirely in ${langName()}, return it exactly unchanged. ` +
   'Return ONLY the translation, no preamble, no notes.'
 
-async function modelFetch($, text, system) {
-  assertTranslationActive($)
+async function modelFetch($, text, system, scope = translationScope()) {
+  assertTranslationActive(scope)
   const r = await $.model.complete({
     model: cfg.model,
     system: system ?? MODEL_SYSTEM(),
     prompt: text,
     maxTokens: MAX_TOKENS,
     timeoutMs: MODEL_TIMEOUT,
-  }, { signal: $[TRANSLATION_SIGNAL] ?? lifecycle.signal })
-  assertTranslationActive($)
+  }, { signal: scope.signal })
+  assertTranslationActive(scope)
   if (!r.isAnswered) throw new Error(`model did not answer (${r.reason ?? 'unknown'})`)
   return { out: r.text.trim(), from: '' }
 }
@@ -152,8 +148,8 @@ function stripThink(s) {
   return s.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
 }
 
-async function openaiFetch($, text, system) {
-  assertTranslationActive($)
+async function openaiFetch($, text, system, scope = translationScope()) {
+  assertTranslationActive(scope)
   const base = cfg.baseUrl.replace(/\/+$/, '')
   const payload = JSON.stringify({
     model: cfg.model,
@@ -169,7 +165,7 @@ async function openaiFetch($, text, system) {
     '-H', 'Content-Type: application/json', '--data-binary', payload]
   if (cfg.apiKey) args.push('-H', `Authorization: Bearer ${cfg.apiKey}`)
   const r = await $.process.run(args)
-  assertTranslationActive($)
+  assertTranslationActive(scope)
   if (r.exitCode !== 0) throw new Error(`openai curl exit ${r.exitCode}`)
   const body = JSON.parse(r.stdout)
   if (body?.choices?.[0]?.finish_reason === 'length') throw new Error('openai truncated (finish_reason=length)')
@@ -368,22 +364,22 @@ function quoteTranslation(text, translation) {
     translation.split("\n").map((line) => `> ${line}`).join("\n") + trailing
 }
 
-const fetchOne = ($, text, opts = {}) =>
+const fetchOne = ($, text, opts = {}, scope = translationScope()) =>
   cfg.provider === 'session'
-    ? modelFetch($, text, opts.system)
+    ? modelFetch($, text, opts.system, scope)
     : cfg.provider === 'openai'
-      ? openaiFetch($, text, opts.system)
-      : msFetch($, text, opts.to)
+      ? openaiFetch($, text, opts.system, scope)
+      : msFetch($, text, opts.to, scope)
 
 /** 一段散文按长度切块翻译；源语言已是目标语言的块原样保留 */
-async function translateProse($, text) {
+async function translateProse($, text, scope = translationScope()) {
   if (looksTechnical(text)) return null
   if (cfg.provider !== 'microsoft' && isMostlyTarget(text)) return null
 
   const out = []
   let any = false
   for (const chunk of chunkParagraph(text)) {
-    const r = await fetchOne($, chunk)
+    const r = await fetchOne($, chunk, {}, scope)
     // 微软的检测是逐请求返回的：只能跳过当前块，不能因为某一块是目标语言就跳过整段。
     if (cfg.provider === 'microsoft' && sameLang(r.from, cfg.lang)) {
       out.push(chunk)
@@ -408,13 +404,13 @@ async function translateProse($, text) {
  * 段落并行翻（并发 4）：本地 llama.cpp 有连续 batching，串行会让长回复等几十秒。
  */
 async function translateBlock($, text, previousParas) {
-  $ = translationScope($)
+  const scope = translationScope()
   const paras = previousParas ? previousParas.map(p => ({ ...p })) : splitParas(text)
   await runPool(paras, 4, async (p) => {
     if (p.text === undefined || (previousParas && !p.error)) return
     delete p.error
     try {
-      const translation = await translateProse($, p.text)
+      const translation = await translateProse($, p.text, scope)
       if (translation) p.translation = translation
     } catch (err) {
       p.error = err
@@ -562,20 +558,20 @@ function protectFileReferences(text) {
 }
 
 /** Rewrite outbound prose while restoring file mentions exactly. */
-async function ensureEnglishProse($, text) {
+async function ensureEnglishProse($, text, scope = translationScope()) {
   const protectedText = protectFileReferences(text)
-  const result = await rewriteEnglishProse($, protectedText.masked)
+  const result = await rewriteEnglishProse($, protectedText.masked, scope)
   return result === null ? null : protectedText.restore(result)
 }
 
-async function rewriteEnglishProse($, text) {
+async function rewriteEnglishProse($, text, scope = translationScope()) {
   if (looksTechnical(text)) return null // 粘贴的错误信息/JSON/日志等原样放行
   if (cfg.provider === 'microsoft') {
     // 超长段按行边界切块逐块送翻；检测出英文的块只保留该块（免费接口没有语法检查能力）
     const out = []
     let any = false
     for (const chunk of chunkParagraph(text)) {
-      const r = await msFetch($, chunk, 'en')
+      const r = await msFetch($, chunk, 'en', scope)
       if (/^en(-|$)/i.test(r.from) && !nonLatinLetterCount(chunk)) {
         out.push(chunk)
         continue
@@ -593,14 +589,14 @@ async function rewriteEnglishProse($, text) {
   let any = false
   for (const chunk of chunkParagraph(text)) {
     const likelyEnglish = isLikelyEnglish(chunk)
-    let en = (await fetchOne($, chunk, { system })).out.trim()
+    let en = (await fetchOne($, chunk, { system }, scope)).out.trim()
     // 不认的改写：输出还是源语言（只润色没翻译）、非拉丁原样返回、英文输入收到元评论。
     // 用明确系统提示重试一次，仍不过就放行该段原文——绝不让废话冒充英文发出。
     const invalid = (candidate) => !okRewrite(chunk, candidate)
     if (invalid(en)) {
       diag($, `outbound suspect in="${chunk.slice(0, 40)}" out="${en.slice(0, 40)}"`)
       const retrySystem = likelyEnglish && nonLatinLetterCount(chunk) === 0 ? OUT_GRAMMAR_RETRY_SYSTEM() : OUT_TRANSLATE_RETRY_SYSTEM()
-      const retry = (await fetchOne($, chunk, { system: retrySystem })).out.trim()
+      const retry = (await fetchOne($, chunk, { system: retrySystem }, scope)).out.trim()
       if (retry && !invalid(retry)) {
         en = retry
         diag($, `outbound retry ok out="${retry.slice(0, 40)}"`)
@@ -616,12 +612,12 @@ async function rewriteEnglishProse($, text) {
 
 /** 出站整块：代码/分隔符不动，散文段并发处理；返回 { text, changed, errors }（没改动时 text 即原文） */
 async function outboundBlock($, text) {
-  $ = translationScope($)
+  const scope = translationScope()
   const paras = splitParas(text)
   await runPool(paras, 4, async (p) => {
     if (p.text === undefined) return
     try {
-      const en = await ensureEnglishProse($, p.text)
+      const en = await ensureEnglishProse($, p.text, scope)
       if (en) p.en = preserveWhitespace(p.text, en)
     } catch (err) {
       p.error = err
