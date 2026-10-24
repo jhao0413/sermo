@@ -1,6 +1,6 @@
 {
   "name": "sermo-grammar",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Check the English in your prompt box and offer a better phrasing, on demand",
   "author": { "name": "jhao" }
 }

@@ -1,6 +1,6 @@
 {
   "name": "pi-sermo-translate",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Translate Pi replies and thinking, and rewrite outgoing prompts into English.",
   "type": "module",
   "keywords": ["pi-package", "pi-extension", "translation"],

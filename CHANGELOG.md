@@ -1,9 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.1.3
 
 - Add a `translation_only` setting for Pi and Claude Code to show translated replies without the source paragraphs; Pi also applies it to thinking content. Code and untranslated paragraphs remain visible.
 - Add `/translate only` and `/translate bilingual` to switch display modes using cached translations. The default remains bilingual display.
+- Retry failed translation requests up to four attempts. If outgoing translation ultimately fails, cancel the entire submission and its remaining translation work instead of sending a partial rewrite.
+
+Validation: 158 tests pass; TypeScript checks pass.
 
 ## 0.1.2
 
