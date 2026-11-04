@@ -16,7 +16,7 @@
  */
 import { getAgentDir, type ExtensionAPI, type ExtensionContext, type MessageEndEvent } from "@earendil-works/pi-coding-agent";
 import type { KeyId, TUI } from "@earendil-works/pi-tui";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -97,17 +97,41 @@ function putCapped<K, V>(map: Map<K, V>, key: K, val: V) {
 
 /* ---------------- 配置 ---------------- */
 
+function readConfig() {
+	let text: string
+	try {
+		text = readFileSync(CONFIG_PATH, "utf8")
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err
+		try {
+			text = readFileSync(LEGACY_CONFIG_PATH, "utf8")
+		} catch (legacyError) {
+			if ((legacyError as NodeJS.ErrnoException).code !== "ENOENT") throw legacyError
+			return {}
+		}
+	}
+	const raw = JSON.parse(text)
+	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new Error("Invalid translation config")
+	return raw as Record<string, unknown>
+}
+
+function savePreference(ctx: ExtensionContext, key: "enabled" | "show_by_default", value: boolean) {
+	try {
+		// Read again so a toggle preserves settings edited since this session started.
+		const raw = readConfig()
+		raw[key] = value
+		mkdirSync(getAgentDir(), { recursive: true })
+		writeFileSync(CONFIG_PATH, JSON.stringify(raw, null, 2) + "\n", { mode: 0o600 })
+	} catch (err) {
+		diag(`save preference failed: ${String(err)}`)
+		toast(ctx, `Translation preference could not be saved to ${CONFIG_PATH}. Check the file and its permissions; this change applies only to the current session.`)
+	}
+}
+
 function loadConfig() {
 	try {
-		let text: string
-		try {
-			text = readFileSync(CONFIG_PATH, "utf8")
-		} catch (err) {
-			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err
-			text = readFileSync(LEGACY_CONFIG_PATH, "utf8")
-		}
-		const raw = JSON.parse(text)
-		if (typeof raw !== "object" || raw === null) return
+		const raw = readConfig()
+		enabled = raw.enabled !== false
 		cfg.showByDefault = typeof raw.show_by_default === "boolean" ? raw.show_by_default : true
 		cfg.translationOnly = raw.translation_only === true
 		cfg.outbound = typeof raw.outbound === "boolean" ? raw.outbound : true
@@ -854,6 +878,7 @@ function toggleShow(ctx: ExtensionContext, next = !show) {
 	diag(`toggle show=${show}`)
 	toast(ctx, `译文：${show ? cfg.translationOnly ? "仅显示译文" : "双语对照" : "隐藏"}`)
 	refreshTranscript(ctx)
+	savePreference(ctx, "show_by_default", show)
 }
 
 /** Enable or disable both outgoing rewrites and reply translation. */
@@ -881,6 +906,7 @@ function toggleTranslation(ctx: ExtensionContext, next = !enabled) {
 	diag(`translation enabled=${enabled}`)
 	toast(ctx, `Translation: ${enabled ? "on" : "off"}`)
 	refreshTranscript(ctx)
+	savePreference(ctx, "enabled", enabled)
 }
 
 /* ---------------- 扩展入口 ---------------- */

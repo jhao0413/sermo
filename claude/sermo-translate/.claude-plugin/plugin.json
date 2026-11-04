@@ -1,13 +1,19 @@
 {
   "name": "sermo-translate",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Translate Claude's replies and outgoing prompts; hotkey toggles reply display, /translate on|off enables or disables translation",
   "author": { "name": "jhao" },
   "userConfig": {
+    "enabled": {
+      "type": "boolean",
+      "title": "默认启用翻译",
+      "description": "首次使用时启用提示词改写和回复翻译。/translate on/off 会保存启停状态，优先于此默认值",
+      "default": true
+    },
     "show_by_default": {
       "type": "boolean",
       "title": "默认显示译文",
-      "description": "开启（默认）时显示回复译文；关闭时隐藏回复译文。Ctrl+Y 或 /translate 切换回复译文显示；/translate on 和 /translate off 启用或停用两侧翻译",
+      "description": "首次使用时是否显示回复译文。Ctrl+Y 或 /translate 会保存显示偏好，优先于此默认值；/translate on/off 启用或停用两侧翻译",
       "default": true
     },
     "translation_only": {

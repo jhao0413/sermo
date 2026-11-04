@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.4
+
+- Remember `/translate on/off` across new sessions and reloads in Pi and Claude Code.
+- Remember reply translation visibility changed with Ctrl+Y or `/translate`.
+- Preserve other configuration when saving preferences and report save failures without interrupting the current session.
+
+Validation: 164 tests pass; Pi TypeScript check and Claude plugin validation pass.
+
 ## 0.1.3
 
 - Add a `translation_only` setting for Pi and Claude Code to show translated replies without the source paragraphs; Pi also applies it to thinking content. Code and untranslated paragraphs remain visible.

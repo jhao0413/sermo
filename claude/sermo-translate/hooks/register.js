@@ -729,7 +729,28 @@ function onRenderText($, text) {
   })
 }
 
-function toggleShow($, next = !show) {
+async function savePreference($, key, value) {
+  try {
+    await $.store.set(key, value)
+  } catch (err) {
+    diag($, `save preference failed: ${String(err)}`)
+    $.ui.toast('Translation preference could not be saved. This change applies only to the current session; see /tmp/pt-live.log.')
+  }
+}
+
+async function restorePreferences($) {
+  try {
+    const savedEnabled = await $.store.get('enabled')
+    const savedShow = await $.store.get('show_by_default')
+    if (typeof savedEnabled === 'boolean') enabled = savedEnabled
+    if (typeof savedShow === 'boolean') show = savedShow
+  } catch (err) {
+    diag($, `restore preferences failed: ${String(err)}`)
+    $.ui.toast('Saved translation preferences could not be loaded. Using configured defaults; see /tmp/pt-live.log.')
+  }
+}
+
+async function toggleShow($, next = !show) {
   show = next
   if (enabled && show) {
     for (const [text, entry] of cache) {
@@ -741,9 +762,10 @@ function toggleShow($, next = !show) {
   diag($, `toggle show=${show}`)
   $.ui.toast(`译文：${show ? cfg.translationOnly ? '仅显示译文' : '双语对照' : '隐藏'}`)
   $.ui.invalidate('ui.render')
+  await savePreference($, 'show_by_default', show)
 }
 
-function setTranslationEnabled($, next) {
+async function setTranslationEnabled($, next) {
   if (enabled !== next) {
     enabled = next
     generation++
@@ -769,13 +791,14 @@ function setTranslationEnabled($, next) {
   $.ui.toast(status)
   diag($, `translation enabled=${enabled}`)
   $.ui.invalidate('ui.render')
+  await savePreference($, 'enabled', enabled)
 }
 
 export function register(on, options) {
   lifecycle.abort()
   lifecycle = new AbortController()
   generation++
-  enabled = true
+  enabled = options?.enabled !== false
   if (stableTimer) stableTimer.cancel()
   stableTimer = null
   seen.clear()
@@ -796,6 +819,7 @@ export function register(on, options) {
   show = cfg.showByDefault
 
   on('session.start', async ($, e, next) => {
+    await restorePreferences($)
     outboundMap.clear()
     await $.command.register({ name: 'translate', description: 'Toggle reply translations; only/bilingual selects display, on/off controls translation', immediate: true })
     $.ui.status(`Translation: ${enabled ? 'on' : 'off'}`)
@@ -807,15 +831,15 @@ export function register(on, options) {
     const state = (e.args ?? '').trim().toLowerCase()
     if (state === 'only' || state === 'bilingual') {
       cfg.translationOnly = state === 'only'
-      toggleShow($, true)
+      await toggleShow($, true)
       return {}
     }
     if (state && state !== 'on' && state !== 'off') {
       $.ui.toast('Usage: /translate [on|off|only|bilingual]')
       return {}
     }
-    if (state) setTranslationEnabled($, state === 'on')
-    else toggleShow($)
+    if (state) await setTranslationEnabled($, state === 'on')
+    else await toggleShow($)
     return {}
   })
 

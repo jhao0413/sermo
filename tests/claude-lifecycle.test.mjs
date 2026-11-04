@@ -17,6 +17,7 @@ async function load(provider, answer) {
   }
   const $ = {
     ui: { toast: message => notices.push(message), status() {}, invalidate() {} },
+    store: { set: async () => {} },
     fs: { write: async () => {} },
     model: { complete: async ({ prompt }, { signal }) => ({ isAnswered: true, text: await request(prompt, signal) }) },
     process: { run: async args => {
@@ -99,6 +100,7 @@ test('session: off aborts the model request signal', async () => {
   let signal, release
   const $ = {
     ui: { toast() {}, status() {}, invalidate() {} },
+    store: { set: async () => {} },
     fs: { write: async () => {} },
     model: { complete: (_request, options) => {
       signal = options.signal

@@ -33,7 +33,11 @@ function load(runtime, options = {}) {
   const sandbox = {
     exports: {}, URLSearchParams, AbortSignal, AbortController, fetch: fetchMock,
     require: (id) => id === '@earendil-works/pi-coding-agent' ? { getAgentDir: () => '/test-agent' }
-      : id === 'node:fs' ? { readFileSync: options.readConfig ?? (() => JSON.stringify(config)) }
+      : id === 'node:fs' ? {
+        readFileSync: options.readConfig ?? (() => JSON.stringify(config)),
+        mkdirSync() {},
+        writeFileSync: options.writeConfig ?? ((_path, text) => Object.assign(config, JSON.parse(text))),
+      }
       : id === 'node:fs/promises' ? { writeFile: async (_path, text) => logs.push(text) } : require(id),
   }
   vm.runInNewContext(code, sandbox, { filename: filename.pathname })
@@ -72,6 +76,10 @@ function load(runtime, options = {}) {
     } },
     command: { register: async command => commands.set(command.name, command) },
     model: { complete: async ({ system, prompt }, options) => ({ isAnswered: true, text: await modelAnswer(system, prompt, options?.signal) }) },
+    store: options.store ?? {
+      get: async () => undefined,
+      set: async () => {},
+    },
     fs: { write: async (_path, text) => logs.push(text) },
     ui: { toast: (message) => notices.push(message), status: text => statuses.set('sermo-translate', text), invalidate() {} },
     process: { run: async (args) => {
@@ -114,6 +122,73 @@ test('Pi: new config takes precedence and legacy config is read only for ENOENT'
       ? ['/test-agent/sermo-translate.json', '/test-agent/parrot-translate.json']
       : ['/test-agent/sermo-translate.json'])
   }
+})
+
+test('Pi: service and visibility preferences survive fresh sessions without losing other settings', async () => {
+  let saved = JSON.stringify({ provider: 'openai', api_key: 'test-key', lang: 'ja', custom: { keep: true } })
+  const storage = {
+    readConfig: () => saved,
+    writeConfig: (path, text) => {
+      assert.equal(path, '/test-agent/sermo-translate.json')
+      saved = text
+    },
+    answer: () => 'これは翻訳です。',
+  }
+  const first = load('pi', storage)
+  await first.commands.get('translate').handler('off', first.ctx)
+  const second = load('pi', storage)
+  await second.hooks.get('session_start')({}, second.ctx)
+  assert.equal(second.statuses.get('sermo-translate'), 'Translation: off')
+  assert.equal(await submit('pi', second, '请检查'), '请检查')
+  await second.commands.get('translate').handler('on', second.ctx)
+  await second.commands.get('translate').handler('', second.ctx)
+  const third = load('pi', storage)
+  await third.hooks.get('session_start')({}, third.ctx)
+  assert.equal(third.statuses.get('sermo-translate'), 'Translation: on')
+  const message = { role: 'assistant', content: [{ type: 'text', text: 'Here is the explanation.' }] }
+  await third.hooks.get('message_end')({ message }, third.ctx)
+  await flush()
+  assert.ok(third.calls.length > 0, 'hidden translations still run in the background')
+  assert.equal(third.transform('Here is the explanation.'), 'Here is the explanation.')
+  await third.commands.get('translate').handler('', third.ctx)
+  const fourth = load('pi', storage)
+  await fourth.hooks.get('message_end')({ message }, fourth.ctx)
+  await flush()
+  assert.match(fourth.transform('Here is the explanation.'), /これは翻訳/)
+  assert.deepEqual(JSON.parse(saved), {
+    provider: 'openai', api_key: 'test-key', lang: 'ja', custom: { keep: true },
+    enabled: true, show_by_default: true,
+  })
+})
+
+test('Pi: saving preferences migrates legacy settings and creates missing config', async () => {
+  for (const legacy of [undefined, { provider: 'session', model: 'custom-model' }]) {
+    let saved
+    const h = load('pi', {
+      readConfig: path => {
+        if (path.endsWith('/parrot-translate.json') && legacy) return JSON.stringify(legacy)
+        throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+      },
+      writeConfig: (_path, text) => { saved = JSON.parse(text) },
+    })
+    await h.commands.get('translate').handler('off', h.ctx)
+    assert.deepEqual(saved, { ...legacy, enabled: false })
+  }
+})
+
+test('Pi: persistence failures keep the session usable and never overwrite invalid config', async () => {
+  for (const invalid of ['{', '[]', 'null']) {
+    let writes = 0
+    const h = load('pi', { readConfig: () => invalid, writeConfig: () => { writes++ } })
+    await h.commands.get('translate').handler('off', h.ctx)
+    assert.equal(writes, 0)
+    assert.equal(h.statuses.get('sermo-translate'), 'Translation: off')
+    assert.ok(h.notices.some(text => text.includes('could not be saved')))
+  }
+  const h = load('pi', { writeConfig: () => { throw new Error('read-only filesystem') } })
+  await h.commands.get('translate').handler('off', h.ctx)
+  assert.equal(await submit('pi', h, '请检查'), '请检查')
+  assert.ok(h.notices.some(text => text.includes('could not be saved')))
 })
 
 test('Pi: off stops both translation paths and on resumes them', async () => {
@@ -1036,6 +1111,78 @@ for (const runtime of ['pi', 'claude']) {
     assert.equal(h.calls.length, 2)
   })
 }
+
+test('Claude: service and visibility choices survive new plugin instances', async () => {
+  const values = new Map()
+  const store = {
+    get: async key => values.get(key),
+    set: async (key, value) => { values.set(key, value) },
+  }
+  const start = async config => {
+    const h = load('claude', { store, config, answer: () => '这是说明。' })
+    await h.hooks.get('session.start')(h.$, {}, e => e)
+    return h
+  }
+  const command = (h, args) => h.hooks.get('command.run')(h.$, { args })
+  const render = h => h.hooks.get('ui.render:AssistantMessage')(h.$,
+    { props: { text: 'Here is the explanation.' } }, e => e.props.text)
+  const first = await start()
+  await command(first, 'off')
+  const second = await start()
+  assert.equal(second.statuses.get('sermo-translate'), 'Translation: off')
+  assert.equal(await submit('claude', second, '请检查'), '请检查')
+  assert.equal(await render(second), 'Here is the explanation.')
+  assert.equal(second.calls.length, 0)
+  assert.equal(second.timers.size, 0)
+  await command(second, 'on')
+  await command(second, '')
+  const third = await start()
+  assert.equal(third.statuses.get('sermo-translate'), 'Translation: on')
+  third.scheduleOne(third.$, 'Here is the explanation.')
+  await flush()
+  assert.equal(third.calls.length, 1)
+  assert.equal(await render(third), 'Here is the explanation.')
+  await command(third, '')
+  const fourth = await start({ show_by_default: false })
+  fourth.scheduleOne(fourth.$, 'Here is the explanation.')
+  await flush()
+  assert.match(await render(fourth), /这是说明/)
+  assert.deepEqual([...values], [['enabled', true], ['show_by_default', true]])
+})
+
+test('Claude: unset and invalid saved preferences use configured defaults', async () => {
+  for (const value of [undefined, null, 'false', 0, { enabled: false }]) {
+    const h = load('claude', {
+      config: { enabled: false, show_by_default: false },
+      store: { get: async () => value, set: async () => {} },
+    })
+    await h.hooks.get('session.start')(h.$, {}, e => e)
+    assert.equal(h.statuses.get('sermo-translate'), 'Translation: off')
+    assert.equal(await submit('claude', h, '请检查'), '请检查')
+    await h.hooks.get('command.run')(h.$, { args: 'on' })
+    h.scheduleOne(h.$, 'Here is the explanation.')
+    await flush()
+    const rendered = await h.hooks.get('ui.render:AssistantMessage')(h.$,
+      { props: { text: 'Here is the explanation.' } }, e => e.props.text)
+    assert.equal(rendered, 'Here is the explanation.')
+  }
+})
+
+test('Claude: store failures report persistence problems and preserve session controls', async () => {
+  const h = load('claude', { store: {
+    get: async () => { throw new Error('read failed') },
+    set: async () => { throw new Error('write failed') },
+  } })
+  let continued = false
+  await h.hooks.get('session.start')(h.$, {}, e => { continued = true; return e })
+  assert.ok(continued)
+  assert.equal(h.statuses.get('sermo-translate'), 'Translation: on')
+  assert.ok(h.notices.some(text => text.includes('could not be loaded')))
+  await h.hooks.get('command.run')(h.$, { args: 'off' })
+  assert.equal(h.statuses.get('sermo-translate'), 'Translation: off')
+  assert.equal(await submit('claude', h, '请检查'), '请检查')
+  assert.ok(h.notices.some(text => text.includes('could not be saved')))
+})
 
 test('Claude: off disables both translation paths and cancels debounce; on resumes', async () => {
   const h = load('claude', { answer: text => text === '请检查' ? 'Please check.' : '这是说明。' })
