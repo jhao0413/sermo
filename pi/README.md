@@ -38,7 +38,7 @@ pi remove npm:pi-sermo-translate
 {
   "show_by_default": true,
   "translation_only": false,
-  "outbound": true,
+  "translate": ["prompts", "replies", "thinking"],
   "lang": "zh-Hans",
   "provider": "openai",
   "model": "index-translate-2b",
@@ -50,14 +50,26 @@ pi remove npm:pi-sermo-translate
 
 仅当 `sermo-translate.json` 不存在时，兼容读取同目录的旧配置 `parrot-translate.json`；新配置格式有误时使用默认值，不回退旧文件。
 
-配置文件不存在时，扩展默认使用微软接口。只想翻译回复、不改写提示词时，将 `outbound` 设为 `false`。下表列出代码中的默认值：
+配置文件不存在时，扩展默认使用微软接口并翻译全部内容。`translate` 选择要翻译的内容：`prompts` 为提示词改写，`replies` 为回复正文（包括工具调用前的说明），`thinking` 为思考过程。只想翻译回复和思考、不改写提示词时，设置 `"translate": ["replies", "thinking"]`。只想翻译思考过程时，合并以下配置，然后运行 `/reload`：
+
+```json
+{
+  "translate": ["thinking"]
+}
+```
+
+这时提示词原样发送，回复正文保留原文，只有思考内容会送去翻译。`translate` 同时控制所选内容的后台翻译和译文显示；设为 `[]` 时不翻译任何内容。Ctrl+Y、显示模式和 `/translate on/off` 仍在所选范围内生效。
+
+旧配置继续兼容：未设置 `translate` 时，读取原有的 `outbound`、`translate_replies` 和 `translate_thinking` 开关；三个开关未设置时均默认开启。设置了有效的 `translate` 列表后，以列表为准。列表类型或值有误时回退旧配置或默认值。
+
+下表列出默认值：
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
 | `enabled` | `true` | 是否启用提示词改写和回复、思考翻译；`/translate on/off` 自动保存此项 |
 | `show_by_default` | `true` | 是否显示回复译文；Ctrl+Y 或 `/translate` 自动保存此项，不控制翻译服务的启停 |
 | `translation_only` | `false` | 开启后回复和思考只显示译文；默认逐段显示双语对照。代码、跳过、翻译中或失败的段落保留原文，不影响用户提示词对照 |
-| `outbound` | `true` | 出站链路总开关 |
+| `translate` | `["prompts", "replies", "thinking"]` | 要翻译的内容；`[]` 表示全部不翻译 |
 | `lang` | `zh-Hans` | 你的语言，微软语言码：`zh-Hant`、`ja`、`ko`、`fr`、`de`、`es`、`ru` 等 |
 | `provider` | `microsoft` | 翻译服务，见下 |
 | `model` | `haiku` | `session` / `openai` 用的模型；填别名 haiku / sonnet / deepseek-chat、完整 id 或 `provider/id` |

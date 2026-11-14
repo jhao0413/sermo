@@ -1,5 +1,5 @@
 /**
- * sermo-translate — Claude 的英文回复自动翻成配置的目标语言；发出的提示词保证是地道英文。
+ * sermo-translate — 回复和实时思考翻成配置的目标语言；可将提示词改写成英文。
  *
  * 行为：回复稳定约 1.5s 后后台翻好缓存；快捷键（Ctrl+Y）切换显示。
  * 默认逐段穿插原文和 `> ` 译文，可配置为仅显示译文。
@@ -19,7 +19,7 @@ const MAX_TOKENS = 16_000 // 单次补全输出上限：3000 字符块的重写�
 const MAP_CAP = 500 // cache / outboundMap 条目上限（FIFO 淘汰最旧，防长会话无限增长）
 
 /** userConfig 传入的配置（register 时初始化） */
-const cfg = { showByDefault: false, translationOnly: false, outbound: true, lang: 'zh-Hans', provider: 'microsoft', model: 'haiku', baseUrl: 'http://127.0.0.1:8021/v1', apiKey: '' }
+const cfg = { showByDefault: false, translationOnly: false, outbound: true, translateReplies: true, translateThinking: true, lang: 'zh-Hans', provider: 'microsoft', model: 'haiku', baseUrl: 'http://127.0.0.1:8021/v1', apiKey: '' }
 
 /** 回复译文显示偏好；enabled 控制两侧翻译的启停。 */
 let show = false
@@ -438,8 +438,7 @@ async function translateProse($, text, scope = translationScope()) {
  * 全部跳过（已是目标语言/无散文）时 md 为 null。
  * 段落并行翻（并发 4）：本地 llama.cpp 有连续 batching，串行会让长回复等几十秒。
  */
-async function translateBlock($, text, previousParas) {
-  const scope = translationScope()
+async function translateBlock($, text, previousParas, scope = translationScope()) {
   const paras = previousParas ? previousParas.map(p => ({ ...p })) : splitParas(text)
   await runPool(paras, 4, async (p) => {
     if (p.text === undefined || (previousParas && !p.error)) return
@@ -715,6 +714,22 @@ function scheduleOne($, text, retry = false) {
     })
 }
 
+// HTTP/curl may ignore cancellation. Release the response stream immediately
+// while their late results finish under the aborted scope and are discarded.
+async function translateLiveThinking($, text, scope) {
+  let cancel
+  const cancelled = new Promise(resolve => {
+    cancel = () => resolve(null)
+    scope.signal.addEventListener('abort', cancel, { once: true })
+    if (scope.signal.aborted) cancel()
+  })
+  try {
+    return await Promise.race([translateBlock($, text, undefined, scope), cancelled])
+  } finally {
+    scope.signal.removeEventListener('abort', cancel)
+  }
+}
+
 function onRenderText($, text) {
   if (!enabled) return
   const epoch = generation
@@ -808,7 +823,11 @@ export function register(on, options) {
   // userConfig（/config 面板或 settings.json 的 pluginConfigs["sermo-translate@inline"]）
   cfg.showByDefault = options?.show_by_default !== false // 默认 true（0.4.3 起）
   cfg.translationOnly = options?.translation_only === true
-  cfg.outbound = options?.outbound !== false
+  const targets = Array.isArray(options?.translate) && options.translate.every(value => ['prompts', 'replies', 'thinking'].includes(value))
+    ? options.translate : undefined
+  cfg.outbound = targets ? targets.includes('prompts') : options?.outbound !== false
+  cfg.translateReplies = targets ? targets.includes('replies') : options?.translate_replies !== false
+  cfg.translateThinking = targets ? targets.includes('thinking') : options?.translate_thinking !== false
   cfg.lang = typeof options?.lang === 'string' && options.lang.trim() ? options.lang.trim() : 'zh-Hans'
   // 旧值 model（≤0.4.1）兼容：映射为 session
   const providerRaw = typeof options?.provider === 'string' ? options.provider.trim() : ''
@@ -818,12 +837,17 @@ export function register(on, options) {
   cfg.apiKey = typeof options?.api_key === 'string' ? options.api_key : ''
   show = cfg.showByDefault
 
+  // Keep old options loadable without adding three more rows to /config.
+  on('config.describe', { key: ['sermo-translate.outbound', 'sermo-translate.translate_replies', 'sermo-translate.translate_thinking'] }, ($, e, next) => {
+    return next({ ...e, isHidden: true })
+  })
+
   on('session.start', async ($, e, next) => {
     await restorePreferences($)
     outboundMap.clear()
-    await $.command.register({ name: 'translate', description: 'Toggle reply translations; only/bilingual selects display, on/off controls translation', immediate: true })
+    await $.command.register({ name: 'translate', description: 'Toggle translations; only/bilingual selects display, on/off controls the service', immediate: true })
     $.ui.status(`Translation: ${enabled ? 'on' : 'off'}`)
-    diag($, `loaded provider=${cfg.provider} model=${cfg.model} baseUrl=${cfg.baseUrl} showByDefault=${cfg.showByDefault} translationOnly=${cfg.translationOnly} outbound=${cfg.outbound} lang=${cfg.lang}`)
+    diag($, `loaded provider=${cfg.provider} model=${cfg.model} baseUrl=${cfg.baseUrl} showByDefault=${cfg.showByDefault} translationOnly=${cfg.translationOnly} outbound=${cfg.outbound} translateReplies=${cfg.translateReplies} translateThinking=${cfg.translateThinking} lang=${cfg.lang}`)
     return next(e)
   })
 
@@ -843,8 +867,58 @@ export function register(on, options) {
     return {}
   })
 
+  // Thinking has no ui.render site. Rewrite only its live display stream;
+  // retaining each chunk's ref preserves the engine's signed transcript block.
+  on('turn.step', async function* ($, e, next) {
+    let scope
+    let thinking = []
+    const stream = next(e)
+    try {
+      while (true) {
+        let item
+        try {
+          item = await stream.next()
+        } catch (err) {
+          // A failed/interrupted provider stream must not erase partial thinking.
+          for (const part of thinking) yield part
+          thinking = []
+          throw err
+        }
+        const chunk = item.value
+        if (thinking.length && (item.done || chunk.kind !== 'thinking' || chunk.index !== thinking[0].index ||
+            !enabled || scope.signal.aborted || scope.epoch !== generation)) {
+          const text = thinking.map(part => part.text).join('')
+          let md
+          if (enabled && cfg.translateThinking && !scope.signal.aborted && scope.epoch === generation) {
+            const result = await translateLiveThinking($, text, scope)
+            if (enabled && show && !scope.signal.aborted && scope.epoch === generation && result?.md) {
+              md = cfg.translationOnly ? translationOnlyBlock(result.paras) : result.md
+            }
+            if (enabled && show && !scope.signal.aborted && scope.epoch === generation && result?.errors) {
+              $.ui.toast('思考翻译失败，保留原文；见 /tmp/pt-live.log')
+            }
+          }
+          for (let i = 0; i < thinking.length; i++) {
+            yield md ? { ...thinking[i], text: i === 0 ? md : '' } : thinking[i]
+          }
+          thinking = []
+          scope.dispose?.()
+          scope = undefined
+        }
+        if (item.done) return item.value
+        if (chunk.kind === 'thinking' && enabled && cfg.translateThinking && !next.signal?.aborted) {
+          if (!thinking.length) scope = translationScope(next.signal)
+          thinking.push(chunk)
+        } else yield chunk
+      }
+    } finally {
+      scope?.dispose?.()
+      await stream.return?.()
+    }
+  })
+
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
-    if (!enabled) return next(e)
+    if (!enabled || !cfg.translateReplies) return next(e)
     const text = e.props?.text
     if (!text || !text.trim()) return next(e)
 

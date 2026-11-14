@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.5
+
+- Add a single `translate` list to Pi and Claude Code to choose `prompts`, `replies`, and/or `thinking`; all are enabled by default. An empty list translates nothing.
+- Support translating thinking alone with `"translate": ["thinking"]`. When the list is omitted, existing `outbound`, `translate_replies`, and `translate_thinking` settings remain effective; legacy switches are hidden from Claude's config panel.
+- Add Claude Code live thinking translation through `turn.step`, preserving the model's signed thinking in the transcript. Thinking blocks appear after translation completes; previously displayed and restored thinking cannot be translated or toggled through Claude's current plugin API.
+
+Validation: 178 shared tests and 6 Claude host tests pass; Pi and Claude TypeScript checks, Claude plugin validation, and npm package inspection pass.
+
 ## 0.1.4
 
 - Remember `/translate on/off` across new sessions and reloads in Pi and Claude Code.

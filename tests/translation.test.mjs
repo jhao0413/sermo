@@ -15,7 +15,7 @@ function load(runtime, options = {}) {
   // Pi helpers live inside the per-session extension closure; expose them only in this test sandbox.
   const source = runtime === 'pi'
     ? implementation.replace('\tloadConfig()', `\tObject.assign(exports, { cfg, ${symbols} });\n\tloadConfig()`)
-    : implementation + `\nexport { ${symbols}, scheduleOne, translateBlock };`
+    : implementation + `\nexport { cfg, ${symbols}, scheduleOne, translateBlock };`
   const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
   const calls = [], notices = [], logs = [], components = [], statuses = new Map(), hooks = new Map(), commands = new Map()
   let transformer
@@ -392,6 +392,191 @@ for (const runtime of ['pi', 'claude']) {
     assert.ok(h.notices.some(message => message.includes('已取消发送')))
   })
 }
+
+for (const runtime of ['pi', 'claude']) {
+  test(`${runtime}: translate list supports every selection and overrides legacy flags`, () => {
+    const names = ['prompts', 'replies', 'thinking']
+    for (let mask = 0; mask < 8; mask++) {
+      const translate = names.filter((_, index) => mask & (1 << index))
+      for (const legacy of [true, false]) {
+        const h = load(runtime, { config: {
+          translate, outbound: legacy, translate_replies: legacy, translate_thinking: legacy,
+        } })
+        assert.deepEqual([h.cfg.outbound, h.cfg.translateReplies, h.cfg.translateThinking],
+          names.map(name => translate.includes(name)))
+      }
+    }
+    const h = load(runtime, { config: { translate: ['thinking', 'thinking'] } })
+    assert.deepEqual([h.cfg.outbound, h.cfg.translateReplies, h.cfg.translateThinking], [false, false, true])
+  })
+
+  test(`${runtime}: omitted or invalid translate lists preserve legacy behavior and defaults`, () => {
+    for (const translate of [undefined, null, true, 'thinking', ['typo'], ['thinking', 1]]) {
+      for (const legacy of [{}, { outbound: false }, { translate_replies: false, translate_thinking: false }]) {
+        const h = load(runtime, { config: { ...legacy, translate } })
+        assert.deepEqual([h.cfg.outbound, h.cfg.translateReplies, h.cfg.translateThinking],
+          [legacy.outbound !== false, legacy.translate_replies !== false, legacy.translate_thinking !== false])
+      }
+    }
+  })
+
+  test(`${runtime}: disabling replies and thinking leaves prompt rewriting independent`, async () => {
+    const h = load(runtime, {
+      config: { translate: ['prompts'] },
+      answer: () => 'Please review this change.',
+    })
+    assert.equal(await submit(runtime, h, '请检查这个修改。'), 'Please review this change.')
+    assert.equal(h.calls.length, 1)
+  })
+}
+
+async function thinkingStream(h, chunks, signal) {
+  const result = { turnId: 'turn-1', index: 0, answer: 'A reply.', toolUses: [], stopReason: 'end_turn', usage: null }
+  const next = Object.assign(async function* () {
+    for await (const chunk of chunks) yield chunk
+    return result
+  }, { signal })
+  const stream = h.hooks.get('turn.step')(h.$, { turnId: 'turn-1', index: 0 }, next)
+  const output = []
+  while (true) {
+    const item = await stream.next()
+    if (item.done) {
+      assert.equal(item.value, result, 'preserve the downstream result')
+      return output
+    }
+    output.push(item.value)
+  }
+}
+
+test('Claude: reply and thinking settings control requests and rendering independently', async () => {
+  for (const translateReplies of [false, true]) {
+    for (const translateThinking of [false, true]) {
+      const text = 'I will inspect the source first.'
+      const h = load('claude', { config: {
+        translate: [...(translateReplies ? ['replies'] : []), ...(translateThinking ? ['thinking'] : [])],
+      } })
+      const chunks = [
+        { kind: 'engine', ref: 1 },
+        { kind: 'thinking', index: 0, text: 'I will inspect ', ref: 2 },
+        { kind: 'thinking', index: 0, text: 'the source first.', ref: 3 },
+        { kind: 'engine', ref: 4 },
+        { kind: 'text', index: 1, text, ref: 5 },
+        { kind: 'tool', index: 2, name: 'Read', id: 'tool-1', ref: 6 },
+        { kind: 'input', index: 2, json: '{"path":"file.ts"}', ref: 7 },
+        { kind: 'stop', stopReason: 'tool_use', usage: null, ref: 8 },
+      ]
+      const before = structuredClone(chunks)
+      const output = await thinkingStream(h, chunks)
+      assert.equal(output.map(c => c.kind === 'thinking' ? c.text : '').join('').includes('译文'), translateThinking)
+      assert.deepEqual(output.map(c => c.ref), chunks.map(c => c.ref), 'retain signed thinking refs and engine order')
+      assert.deepEqual(output.filter(c => c.kind !== 'thinking'), chunks.filter(c => c.kind !== 'thinking'))
+      const render = () => h.hooks.get('ui.render:AssistantMessage')(h.$, { props: { text } }, e => e.props.text)
+      assert.equal(await render(), text)
+      for (const timer of [...h.timers]) { timer.cancel(); timer.callback() }
+      await flush()
+      assert.equal((await render()).includes('译文'), translateReplies)
+      assert.equal(h.calls.length, Number(translateThinking) + Number(translateReplies))
+      assert.equal(await submit('claude', h, '请检查'), '请检查')
+      await h.hooks.get('command.run')(h.$, { args: 'only' })
+      const only = await thinkingStream(h, chunks)
+      assert.equal(only.filter(c => c.kind === 'thinking').map(c => c.text).join(''), translateThinking ? `译文：${text}` : text)
+      assert.equal((await render()).includes('译文'), translateReplies)
+      await h.hooks.get('command.run')(h.$, { args: 'off' })
+      const count = h.calls.length
+      assert.deepEqual(await thinkingStream(h, chunks), chunks)
+      assert.equal(h.calls.length, count)
+      assert.deepEqual(chunks, before, 'never mutate source chunks')
+    }
+  }
+})
+
+test('Claude: thinking uses defaults, preserves separate blocks and translates while hidden', async () => {
+  const h = load('claude', { config: { show_by_default: false } })
+  const chunks = [
+    { kind: 'thinking', index: 0, text: 'I should inspect the code.', ref: 1 },
+    { kind: 'thinking', index: 1, text: 'Then I should run the tests.', ref: 2 },
+  ]
+  assert.deepEqual(await thinkingStream(h, chunks), chunks)
+  assert.equal(h.calls.length, 2)
+  await h.hooks.get('command.run')(h.$, { args: 'bilingual' })
+  const output = await thinkingStream(h, chunks)
+  assert.ok(output.every(c => c.text.includes('译文')))
+})
+
+test('Claude: thinking failures preserve originals in translation-only mode', async () => {
+  const h = load('claude', { config: { translation_only: true }, answer: () => { throw new Error('offline') } })
+  const chunks = [{ kind: 'thinking', index: 0, text: 'I should inspect the code.', ref: 1 }]
+  assert.deepEqual(await thinkingStream(h, chunks), chunks)
+  assert.ok(h.notices.some(message => message.includes('思考翻译失败')))
+})
+
+test('Claude: disabling or interrupting thinking releases the stream before requests finish', { timeout: 2000 }, async () => {
+  for (const provider of ['microsoft', 'session', 'openai']) {
+    for (const cancel of ['off', 'interrupt']) {
+      let release
+      const h = load('claude', { config: { provider }, answer: () => new Promise(resolve => { release = resolve }) })
+      const chunks = [{ kind: 'thinking', index: 0, text: 'I should inspect the code.', ref: 1 }]
+      const controller = new AbortController()
+      const pending = thinkingStream(h, chunks, controller.signal)
+      await flush()
+      assert.equal(h.calls.length, 1)
+      if (cancel === 'off') await h.hooks.get('command.run')(h.$, { args: 'off' })
+      else controller.abort()
+      if (provider === 'session') assert.equal(h.calls[0].signal.aborted, true)
+      assert.deepEqual(await pending, chunks, 'release original thinking without awaiting the provider')
+      release('这是思考译文。')
+      await flush()
+      assert.equal(h.calls.length, 1)
+      assert.ok(!h.notices.some(message => message.includes('失败')))
+    }
+  }
+})
+
+test('Claude: disabling during thinking collection preserves chunk order', async () => {
+  const h = load('claude')
+  const chunks = ['I should ', 'inspect ', 'the code.'].map((text, ref) => ({ kind: 'thinking', index: 0, text, ref }))
+  async function* source() {
+    yield chunks[0]
+    await h.hooks.get('command.run')(h.$, { args: 'off' })
+    yield chunks[1]
+    yield chunks[2]
+  }
+  assert.deepEqual(await thinkingStream(h, source()), chunks)
+  assert.equal(h.calls.length, 0)
+})
+
+test('Claude: re-enabling within a step translates later thinking with a fresh scope', async () => {
+  const h = load('claude')
+  const first = { kind: 'thinking', index: 0, text: 'I should inspect the code.', ref: 1 }
+  const boundary = { kind: 'engine', ref: 2 }
+  const second = { kind: 'thinking', index: 1, text: 'Then I should run the tests.', ref: 3 }
+  async function* source() {
+    yield first
+    await h.hooks.get('command.run')(h.$, { args: 'off' })
+    await h.hooks.get('command.run')(h.$, { args: 'on' })
+    yield boundary
+    yield second
+  }
+  const output = await thinkingStream(h, source())
+  assert.deepEqual(output.slice(0, 2), [first, boundary], 'discard the cancelled block translation')
+  assert.equal(output[2].ref, second.ref)
+  assert.match(output[2].text, /译文/)
+  assert.deepEqual(h.calls.map(call => call.text), [second.text])
+})
+
+test('Claude: a failing provider stream preserves partial thinking and propagates the error', async () => {
+  const h = load('claude')
+  const chunk = { kind: 'thinking', index: 0, text: 'I should inspect the code.', ref: 1 }
+  const failure = new Error('provider stream disconnected')
+  const next = async function* () {
+    yield chunk
+    throw failure
+  }
+  const stream = h.hooks.get('turn.step')(h.$, { turnId: 'turn-1', index: 0 }, next)
+  assert.deepEqual((await stream.next()).value, chunk)
+  await assert.rejects(stream.next(), err => err === failure)
+  assert.equal(h.calls.length, 0)
+})
 
 test('Claude: an unexpected outbound exception returns a valid drop result', async () => {
   const h = load('claude')
@@ -789,6 +974,45 @@ test('Pi: file references adjoining Chinese prose and paths with punctuation are
       return text.replace('请检查', 'Please review')
     } })
     assert.equal(await submit('pi', h, source), source.replace('请检查', 'Please review'))
+  }
+})
+
+test('Pi: reply and thinking settings control requests and rendering independently', async () => {
+  for (const translateReplies of [false, true]) {
+    for (const translateThinking of [false, true]) {
+      const shared = 'I will inspect the source first.'
+      const reply = 'Here is the explanation.'
+      const message = { role: 'assistant', content: [
+        { type: 'thinking', thinking: shared },
+        { type: 'text', text: `${shared}\n\n${reply}` },
+      ] }
+      const before = structuredClone(message)
+      const h = load('pi', { config: {
+        translate: [...(translateReplies ? ['replies'] : []), ...(translateThinking ? ['thinking'] : [])],
+      }, branch: [{ type: 'message', message }] })
+      await h.hooks.get('session_start')({}, h.ctx)
+      await h.hooks.get('message_update')({ message, assistantMessageEvent: { type: 'thinking_end' } }, h.ctx)
+      await h.hooks.get('message_end')({ message }, h.ctx)
+      await flush()
+      assert.deepEqual(h.calls.map(call => call.text).sort(),
+        [...(translateReplies || translateThinking ? [shared] : []), ...(translateReplies ? [reply] : [])].sort())
+      assert.equal(await submit('pi', h, '请检查'), '请检查')
+      const render = () => {
+        assert.equal(h.transform(shared, 'assistant-thinking').includes('译文'), translateThinking)
+        assert.equal(h.transform(`${shared}\n\n${reply}`).includes('译文'), translateReplies)
+      }
+      render()
+      await h.commands.get('translate').handler('only', h.ctx)
+      render()
+      await h.commands.get('translate').handler('off', h.ctx)
+      assert.equal(h.transform(shared, 'assistant-thinking'), shared)
+      const count = h.calls.length
+      await h.commands.get('translate').handler('on', h.ctx)
+      await flush()
+      render()
+      assert.equal(h.calls.length, count)
+      assert.deepEqual(message, before)
+    }
   }
 })
 

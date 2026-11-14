@@ -1,26 +1,32 @@
 {
   "name": "sermo-translate",
-  "version": "0.1.4",
-  "description": "Translate Claude's replies and outgoing prompts; hotkey toggles reply display, /translate on|off enables or disables translation",
+  "version": "0.1.5",
+  "description": "Translate Claude's replies, live thinking and outgoing prompts; /translate controls translation and display",
   "author": { "name": "jhao" },
   "userConfig": {
     "enabled": {
       "type": "boolean",
       "title": "默认启用翻译",
-      "description": "首次使用时启用提示词改写和回复翻译。/translate on/off 会保存启停状态，优先于此默认值",
+      "description": "首次使用时启用已选择的提示词改写、回复和实时思考翻译。/translate on/off 会保存启停状态，优先于此默认值",
       "default": true
     },
     "show_by_default": {
       "type": "boolean",
       "title": "默认显示译文",
-      "description": "首次使用时是否显示回复译文。Ctrl+Y 或 /translate 会保存显示偏好，优先于此默认值；/translate on/off 启用或停用两侧翻译",
+      "description": "首次使用时是否显示译文。Ctrl+Y 或 /translate 会保存显示偏好，优先于此默认值；思考在每块完成时应用当前偏好，不能事后切换",
       "default": true
     },
     "translation_only": {
       "type": "boolean",
       "title": "仅显示译文",
-      "description": "开启后，已翻译的回复段落只显示译文；代码、跳过、翻译中或失败的段落保留原文。默认关闭，显示双语对照。/translate only 和 /translate bilingual 可在会话中切换",
+      "description": "开启后，已翻译的回复和实时思考段落只显示译文；代码、跳过、翻译中或失败的段落保留原文。默认关闭，显示双语对照。/translate only 和 /translate bilingual 可在会话中切换",
       "default": false
+    },
+    "translate": {
+      "type": "string",
+      "multiple": true,
+      "title": "翻译哪些内容",
+      "description": "填写 prompts（提示词）、replies（回复正文）、thinking（实时思考）的列表；默认全部，空列表不翻译任何内容。思考不支持历史重翻或事后切换显示"
     },
     "outbound": {
       "type": "boolean",
@@ -28,10 +34,22 @@
       "description": "提交时把提示词改写成地道英文：其他语言忠实翻译、英文只修语法，不改意思；用户消息行双语对照显示",
       "default": true
     },
+    "translate_replies": {
+      "type": "boolean",
+      "title": "翻译回复正文",
+      "description": "翻译回复正文，包括工具调用前的说明；关闭后保留原文，不影响思考翻译或提示词改写",
+      "default": true
+    },
+    "translate_thinking": {
+      "type": "boolean",
+      "title": "翻译实时思考",
+      "description": "思考块完成后翻译其当前显示内容，保留模型签名的原文；不支持历史思考重翻或事后切换显示",
+      "default": true
+    },
     "lang": {
       "type": "string",
       "title": "目标语言（你的语言）",
-      "description": "回复译成哪种语言，做微软语言码：zh-Hans（默认）、zh-Hant、ja、ko、fr、de、es、ru 等；出站始终发英文",
+      "description": "回复和实时思考译成哪种语言，使用微软语言码：zh-Hans（默认）、zh-Hant、ja、ko、fr、de、es、ru 等；启用提示词改写时始终发英文",
       "default": "zh-Hans"
     },
     "provider": {

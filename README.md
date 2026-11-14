@@ -34,6 +34,8 @@ claude plugin install sermo-translate@sermo
 
 回复译文只影响显示，不写入模型上下文；会话保存实际发送的提示词。默认使用微软翻译接口，也可以配置会话模型或 OpenAI 兼容服务。
 
+两个版本都支持分别控制提示词、回复正文和思考翻译。只想翻译思考过程时，设置 `"translate": ["thinking"]`。Claude Code 的思考翻译仅作用于实时显示，Pi 也支持历史思考翻译和事后切换；配置位置和限制见上方对应版本的使用说明。
+
 ## 网站
 
 运行 `npm run dev`，打开 http://localhost:5173 预览 Sermo 网站，无需安装依赖。静态部署说明见 [website/README.md](website/README.md)。

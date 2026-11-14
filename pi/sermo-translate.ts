@@ -39,6 +39,8 @@ const cfg = {
 	showByDefault: true,
 	translationOnly: false,
 	outbound: true,
+	translateReplies: true,
+	translateThinking: true,
 	lang: "zh-Hans",
 	provider: "microsoft",
 	model: "haiku",
@@ -134,7 +136,11 @@ function loadConfig() {
 		enabled = raw.enabled !== false
 		cfg.showByDefault = typeof raw.show_by_default === "boolean" ? raw.show_by_default : true
 		cfg.translationOnly = raw.translation_only === true
-		cfg.outbound = typeof raw.outbound === "boolean" ? raw.outbound : true
+		const targets = Array.isArray(raw.translate) && raw.translate.every(value => ["prompts", "replies", "thinking"].includes(value))
+			? raw.translate : undefined
+		cfg.outbound = targets ? targets.includes("prompts") : raw.outbound !== false
+		cfg.translateReplies = targets ? targets.includes("replies") : raw.translate_replies !== false
+		cfg.translateThinking = targets ? targets.includes("thinking") : raw.translate_thinking !== false
 		if (typeof raw.lang === "string" && raw.lang.trim()) cfg.lang = raw.lang.trim()
 		const providerRaw = typeof raw.provider === "string" ? raw.provider.trim() : ""
 		// 旧值 model（Claude 版 ≤0.4.1）兼容：映射为 session
@@ -825,10 +831,10 @@ function scheduleMessage(ctx: ExtensionContext, msg: MessageEndEvent["message"])
 	}
 	for (const block of msg.content) {
 		if (block.type === "thinking") {
-			if (block.thinking.trim()) thinking.push(block.thinking)
+			if (cfg.translateThinking && block.thinking.trim()) thinking.push(block.thinking)
 		} else {
 			flushThinking()
-			if (block.type === "text" && block.text.trim()) void scheduleBlock(ctx, block.text)
+			if (cfg.translateReplies && block.type === "text" && block.text.trim()) void scheduleBlock(ctx, block.text)
 		}
 	}
 	flushThinking()
@@ -929,7 +935,7 @@ function toggleTranslation(ctx: ExtensionContext, next = !enabled) {
 	}
 
 	pi.registerCommand("translate", {
-		description: "Toggle reply translations; only/bilingual selects display, on/off controls translation",
+		description: "Toggle translations; only/bilingual selects display, on/off controls the service",
 		handler: async (args, ctx) => {
 			const state = args.trim().toLowerCase()
 			if (state === "only" || state === "bilingual") {
@@ -953,7 +959,7 @@ function toggleTranslation(ctx: ExtensionContext, next = !enabled) {
 		try {
 			if (!enabled) return md
 			if (mctx.messageType === "assistant" || mctx.messageType === "assistant-thinking") {
-				if (!show) return md
+				if (!show || (mctx.messageType === "assistant" ? !cfg.translateReplies : !cfg.translateThinking)) return md
 				return splitParas(md).map((part) => {
 					if (part.text === undefined) return part.code ?? ""
 					const entry = cache.get(part.text.trim())
@@ -1051,7 +1057,7 @@ function toggleTranslation(ctx: ExtensionContext, next = !enabled) {
 		updateTranslationStatus(ctx)
 		diag(
 			`loaded provider=${cfg.provider} model=${cfg.model} baseUrl=${cfg.baseUrl} ` +
-				`showByDefault=${cfg.showByDefault} translationOnly=${cfg.translationOnly} outbound=${cfg.outbound} lang=${cfg.lang} toggle=${cfg.toggleKey}`,
+				`showByDefault=${cfg.showByDefault} translationOnly=${cfg.translationOnly} outbound=${cfg.outbound} translateReplies=${cfg.translateReplies} translateThinking=${cfg.translateThinking} lang=${cfg.lang} toggle=${cfg.toggleKey}`,
 		)
 	})
 }
